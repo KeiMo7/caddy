@@ -3,6 +3,7 @@ package standard
 import (
 	// standard Caddy HTTP app modules
 	_ "github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	_ "github.com/caddyserver/caddy/v2/modules/caddyhttp/backpressure"
 	_ "github.com/caddyserver/caddy/v2/modules/caddyhttp/caddyauth"
 	_ "github.com/caddyserver/caddy/v2/modules/caddyhttp/encode"
 	_ "github.com/caddyserver/caddy/v2/modules/caddyhttp/encode/brotli"

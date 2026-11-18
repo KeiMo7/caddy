@@ -93,6 +93,7 @@ var defaultDirectiveOrder = []string{
 	"copy_response", // only in reverse_proxy's handle_response
 	"respond",
 	"metrics",
+	"backpressure",
 	"reverse_proxy",
 	"php_fastcgi",
 	"file_server",
