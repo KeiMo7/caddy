@@ -131,6 +131,10 @@ type ConfigSettings struct {
 	// are not persisted; only configs that are pushed to Caddy get persisted.
 	Persist *bool `json:"persist,omitempty"`
 
+	// Apply configures transactional consistency for config changes.
+	// Disabled by default.
+	Apply *ConfigApply `json:"apply,omitempty"`
+
 	// Loads a new configuration. This is helpful if your configs are
 	// managed elsewhere and you want Caddy to pull its config dynamically
 	// when it starts. The pulled config completely replaces the current
@@ -152,6 +156,27 @@ type ConfigSettings struct {
 	// EXPERIMENTAL: Subject to change.
 	LoadDelay Duration `json:"load_delay,omitempty"`
 }
+
+// ConfigApply configures how a pushed configuration is applied.
+//
+// When enabled, Caddy provisions and starts the candidate configuration
+// before switching the active configuration. If any stage before the
+// commit fails, the candidate is stopped and drained, and the previous
+// configuration remains active. If rollback itself fails, new configs are
+// rejected until the failure is explicitly acknowledged.
+type ConfigApply struct {
+	// Enabled turns on transactional config application. Default: false.
+	Enabled bool `json:"enabled,omitempty"`
+
+	// DrainTimeout bounds how long Caddy waits for in-flight requests to
+	// finish before forcefully closing the candidate during a rollback,
+	// or the previous configuration after a commit. Default: 30s.
+	DrainTimeout Duration `json:"drain_timeout,omitempty"`
+}
+
+// DefaultConfigApplyDrainTimeout is the default drain timeout for
+// transactional config application.
+const DefaultConfigApplyDrainTimeout = 30 * time.Second
 
 // IdentityConfig configures management of this server's identity. An identity
 // consists of credentials that uniquely verify this instance; for example,
@@ -263,6 +288,8 @@ func (admin *AdminConfig) newAdminHandler(addr NetworkAddress, remote bool, ctx 
 
 	// register standard config control endpoints
 	addRoute("/"+rawConfigKey+"/", handlerLabel, AdminHandlerFunc(handleConfig))
+	addRoute("/"+rawConfigKey+"/apply/status", handlerLabel, AdminHandlerFunc(handleConfigApplyStatus))
+	addRoute("/"+rawConfigKey+"/apply/recover", handlerLabel, AdminHandlerFunc(handleConfigApplyRecover))
 	addRoute("/id/", handlerLabel, AdminHandlerFunc(handleConfigID))
 	addRoute("/stop", handlerLabel, AdminHandlerFunc(handleStop))
 
@@ -374,252 +401,33 @@ func (admin AdminConfig) allowedOrigins(addr NetworkAddress) []*url.URL {
 // Critically note that some elements and functionality of the context
 // may not be ready, e.g. storage. Tread carefully.
 func replaceLocalAdminServer(cfg *Config, ctx Context) error {
-	// always* be sure to close down the old admin endpoint
-	// as gracefully as possible, even if the new one is
-	// disabled -- careful to use reference to the current
-	// (old) admin endpoint since it will be different
-	// when the function returns
-	// (* except if the new one fails to start)
-	oldAdminServer := localAdminServer
-	var err error
-	defer func() {
-		// do the shutdown asynchronously so that any
-		// current API request gets a response; this
-		// goroutine may last a few seconds
-		if oldAdminServer != nil && err == nil {
-			go func(oldAdminServer *http.Server) {
-				err := stopAdminServer(oldAdminServer)
-				if err != nil {
-					Log().Named("admin").Error("stopping current admin endpoint", zap.Error(err))
-				}
-			}(oldAdminServer)
-		}
-	}()
-
-	// set a default if admin wasn't otherwise configured
-	if cfg.Admin == nil {
-		cfg.Admin = &AdminConfig{
-			Listen: DefaultAdminListen,
-		}
-	}
-
-	// if new admin endpoint is to be disabled, we're done
-	if cfg.Admin.Disabled {
-		Log().Named("admin").Warn("admin endpoint disabled")
-		return nil
-	}
-
-	// extract a singular listener address
-	addr, err := parseAdminListenAddr(cfg.Admin.Listen, DefaultAdminListen)
+	prepared, err := prepareLocalAdminServer(cfg, ctx)
 	if err != nil {
 		return err
 	}
-
-	handler, err := cfg.Admin.newAdminHandler(addr, false, ctx)
-	if err != nil {
-		return err
-	}
-
-	ln, err := addr.Listen(context.TODO(), 0, net.ListenConfig{})
-	if err != nil {
-		return err
-	}
-
-	serverMu.Lock()
-	localAdminServer = &http.Server{
-		Addr:              addr.String(), // for logging purposes only
-		Handler:           handler,
-		ReadTimeout:       10 * time.Second,
-		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    1024 * 64,
-	}
-	serverMu.Unlock()
-
-	adminLogger := Log().Named("admin")
-	go func() {
-		serverMu.Lock()
-		server := localAdminServer
-		serverMu.Unlock()
-		if err := server.Serve(ln.(net.Listener)); !errors.Is(err, http.ErrServerClosed) {
-			adminLogger.Error("admin server shutdown for unknown reason", zap.Error(err))
-		}
-	}()
-
-	adminLogger.Info("admin endpoint started",
-		zap.String("address", addr.String()),
-		zap.Bool("enforce_origin", cfg.Admin.EnforceOrigin),
-		zap.Array("origins", loggableURLArray(handler.allowedOrigins)))
-
-	if !handler.enforceHost {
-		adminLogger.Warn("admin endpoint on open interface; host checking disabled",
-			zap.String("address", addr.String()))
-	}
-
+	prepared.Commit()
 	return nil
 }
 
 // manageIdentity sets up automated identity management for this server.
 func manageIdentity(ctx Context, cfg *Config) error {
-	if cfg == nil || cfg.Admin == nil || cfg.Admin.Identity == nil {
-		return nil
+	prepared, err := prepareIdentity(ctx, cfg)
+	if err != nil {
+		return err
 	}
-
-	// set default issuers; this is pretty hacky because we can't
-	// import the caddytls package -- but it works
-	if cfg.Admin.Identity.IssuersRaw == nil {
-		cfg.Admin.Identity.IssuersRaw = []json.RawMessage{
-			json.RawMessage(`{"module": "acme"}`),
-		}
-	}
-
-	// load and provision issuer modules
-	if cfg.Admin.Identity.IssuersRaw != nil {
-		val, err := ctx.LoadModule(cfg.Admin.Identity, "IssuersRaw")
-		if err != nil {
-			return fmt.Errorf("loading identity issuer modules: %s", err)
-		}
-		for _, issVal := range val.([]any) {
-			cfg.Admin.Identity.issuers = append(cfg.Admin.Identity.issuers, issVal.(certmagic.Issuer))
-		}
-	}
-
-	// we'll make a new cache when we make the CertMagic config, so stop any previous cache
-	if identityCertCache != nil {
-		identityCertCache.Stop()
-	}
-
-	logger := Log().Named("admin.identity")
-	cmCfg := cfg.Admin.Identity.certmagicConfig(logger, true)
-
-	// issuers have circular dependencies with the configs because,
-	// as explained in the caddytls package, they need access to the
-	// correct storage and cache to solve ACME challenges
-	for _, issuer := range cfg.Admin.Identity.issuers {
-		// avoid import cycle with caddytls package, so manually duplicate the interface here, yuck
-		if annoying, ok := issuer.(interface{ SetConfig(cfg *certmagic.Config) }); ok {
-			annoying.SetConfig(cmCfg)
-		}
-	}
-
-	// obtain and renew server identity certificate(s)
-	return cmCfg.ManageAsync(ctx, cfg.Admin.Identity.Identifiers)
+	prepared.Commit()
+	return nil
 }
 
 // replaceRemoteAdminServer replaces the running remote admin server
 // according to the relevant configuration in cfg. It stops any previous
 // remote admin server and only starts a new one if configured.
 func replaceRemoteAdminServer(ctx Context, cfg *Config) error {
-	if cfg == nil {
-		return nil
-	}
-
-	remoteLogger := Log().Named("admin.remote")
-
-	oldAdminServer := remoteAdminServer
-	defer func() {
-		if oldAdminServer != nil {
-			go func(oldAdminServer *http.Server) {
-				err := stopAdminServer(oldAdminServer)
-				if err != nil {
-					Log().Named("admin").Error("stopping current secure admin endpoint", zap.Error(err))
-				}
-			}(oldAdminServer)
-		}
-	}()
-
-	if cfg.Admin == nil || cfg.Admin.Remote == nil {
-		return nil
-	}
-
-	addr, err := parseAdminListenAddr(cfg.Admin.Remote.Listen, DefaultRemoteAdminListen)
+	prepared, err := prepareRemoteAdminServer(ctx, cfg)
 	if err != nil {
 		return err
 	}
-
-	// make the HTTP handler but disable Host/Origin enforcement
-	// because we are using TLS authentication instead
-	handler, err := cfg.Admin.newAdminHandler(addr, true, ctx)
-	if err != nil {
-		return err
-	}
-
-	// create client certificate pool for TLS mutual auth, and extract public keys
-	// so that we can enforce access controls at the application layer
-	clientCertPool := x509.NewCertPool()
-	for i, accessControl := range cfg.Admin.Remote.AccessControl {
-		for j, certBase64 := range accessControl.PublicKeys {
-			cert, err := decodeBase64DERCert(certBase64)
-			if err != nil {
-				return fmt.Errorf("access control %d public key %d: parsing base64 certificate DER: %v", i, j, err)
-			}
-			accessControl.publicKeys = append(accessControl.publicKeys, cert.PublicKey)
-			clientCertPool.AddCert(cert)
-		}
-		for j, perm := range accessControl.Permissions {
-			for _, permPath := range perm.Paths {
-				if permPath == "" || permPath == "/" {
-					continue
-				}
-				cleanPath := path.Clean(permPath)
-				hasCanonicalTrailingSlash := cleanPath != "/" && strings.TrimSuffix(permPath, "/") == cleanPath
-				if cleanPath != permPath && !hasCanonicalTrailingSlash {
-					return fmt.Errorf("access control %d permission %d: path %q is not canonical (did you mean %q?)", i, j, permPath, cleanPath)
-				}
-			}
-		}
-	}
-
-	// create TLS config that will enforce mutual authentication
-	if identityCertCache == nil {
-		return fmt.Errorf("cannot enable remote admin without a certificate cache; configure identity management to initialize a certificate cache")
-	}
-	cmCfg := cfg.Admin.Identity.certmagicConfig(remoteLogger, false)
-	tlsConfig := cmCfg.TLSConfig()
-	tlsConfig.NextProtos = nil // this server does not solve ACME challenges
-	tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
-	tlsConfig.ClientCAs = clientCertPool
-
-	// convert logger to stdlib so it can be used by HTTP server
-	serverLogger, err := zap.NewStdLogAt(remoteLogger, zap.DebugLevel)
-	if err != nil {
-		return err
-	}
-
-	serverMu.Lock()
-	// create secure HTTP server
-	remoteAdminServer = &http.Server{
-		Addr:              addr.String(), // for logging purposes only
-		Handler:           handler,
-		TLSConfig:         tlsConfig,
-		ReadTimeout:       10 * time.Second,
-		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    1024 * 64,
-		ErrorLog:          serverLogger,
-	}
-	serverMu.Unlock()
-
-	// start listener
-	lnAny, err := addr.Listen(ctx, 0, net.ListenConfig{})
-	if err != nil {
-		return err
-	}
-	ln := lnAny.(net.Listener)
-	ln = tls.NewListener(ln, tlsConfig)
-
-	go func() {
-		serverMu.Lock()
-		server := remoteAdminServer
-		serverMu.Unlock()
-		if err := server.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
-			remoteLogger.Error("admin remote server shutdown for unknown reason", zap.Error(err))
-		}
-	}()
-
-	remoteLogger.Info("secure admin remote control endpoint started",
-		zap.String("address", addr.String()))
-
+	prepared.Commit()
 	return nil
 }
 

@@ -719,11 +719,21 @@ func (w stdlibLogRouter) Write(p []byte) (int, error) {
 
 // Stop gracefully shuts down the HTTP server.
 func (app *App) Stop() error {
-	return app.stop(caddy.Exiting())
+	return app.stopContext(context.Background(), caddy.Exiting(), false)
 }
 
-func (app *App) stop(exiting bool) error {
-	ctx := context.Background()
+// StopContext gracefully shuts down the HTTP server using ctx as the upper
+// bound for draining active connections. When the context ends, remaining
+// connections are forcefully closed so shutdown always converges.
+func (app *App) StopContext(ctx context.Context) error {
+	return app.stopContext(ctx, caddy.Exiting(), true)
+}
+
+func (app *App) stopContext(parent context.Context, exiting, wait bool) error {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx := parent
 
 	// see if any listeners in our config will be closing or if they are continuing
 	// through a reload; because if any are closing, we will enforce shutdown delay
@@ -795,9 +805,14 @@ func (app *App) stop(exiting bool) error {
 			if cause := context.Cause(ctx); cause != nil && errors.Is(err, context.DeadlineExceeded) {
 				err = cause
 			}
-			app.logger.Error("server shutdown",
+			app.logger.Warn("server shutdown",
 				zap.Error(err),
 				zap.Strings("addresses", server.Listen))
+			if closeErr := server.server.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
+				app.logger.Error("force-closing server",
+					zap.Error(closeErr),
+					zap.Strings("addresses", server.Listen))
+			}
 		}
 	}
 	stopH3Server := func(server *Server) {
@@ -840,9 +855,14 @@ func (app *App) stop(exiting bool) error {
 			if cause := context.Cause(ctx); cause != nil && errors.Is(err, context.DeadlineExceeded) {
 				err = cause
 			}
-			app.logger.Error("HTTP/3 server shutdown",
+			app.logger.Warn("HTTP/3 server shutdown",
 				zap.Error(err),
 				zap.Strings("addresses", server.Listen))
+			if closeErr := server.h3server.Close(); closeErr != nil {
+				app.logger.Error("force-closing HTTP/3 server",
+					zap.Error(closeErr),
+					zap.Strings("addresses", server.Listen))
+			}
 		}
 		if err := <-fbErr; err != nil {
 			app.logger.Error("HTTP/3 fallback shutdown",
@@ -886,19 +906,21 @@ func (app *App) stop(exiting bool) error {
 	// if the process isn't exiting (but note that frequent config
 	// reloads with long grace periods for a sustained length of time
 	// may deplete resources)
-	if exiting {
+	if exiting || wait {
 		finishedShutdown.Wait()
 
 		// Responses from earlier configurations must finish before the process exits.
-		pendingServerShutdowns.Range(func(done, _ any) bool {
-			select {
-			case <-done.(chan struct{}):
-				return true
-			case <-ctx.Done():
-				app.logger.Error("waiting for previous server shutdowns", zap.Error(context.Cause(ctx)))
-				return false
-			}
-		})
+		if exiting {
+			pendingServerShutdowns.Range(func(done, _ any) bool {
+				select {
+				case <-done.(chan struct{}):
+					return true
+				case <-ctx.Done():
+					app.logger.Error("waiting for previous server shutdowns", zap.Error(context.Cause(ctx)))
+					return false
+				}
+			})
+		}
 	}
 
 	// run stop callbacks now that the server shutdowns are complete
@@ -972,7 +994,8 @@ var pendingServerShutdowns sync.Map
 
 // Interface guards
 var (
-	_ caddy.App         = (*App)(nil)
-	_ caddy.Provisioner = (*App)(nil)
-	_ caddy.Validator   = (*App)(nil)
+	_ caddy.App            = (*App)(nil)
+	_ caddy.ContextStopper = (*App)(nil)
+	_ caddy.Provisioner    = (*App)(nil)
+	_ caddy.Validator      = (*App)(nil)
 )

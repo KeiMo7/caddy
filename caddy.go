@@ -29,6 +29,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -168,6 +169,12 @@ func changeConfig(method, path string, input []byte, ifMatchHeader string, force
 	rawCfgMu.Lock()
 	defer rawCfgMu.Unlock()
 
+	if err := configApplyBlockedError(); err != nil {
+		return err
+	}
+
+	previousCfgJSON := rawCfgJSON
+
 	if ifMatchHeader != "" {
 		// expect the first and last character to be quotes
 		if len(ifMatchHeader) < 2 || ifMatchHeader[0] != '"' || ifMatchHeader[len(ifMatchHeader)-1] != '"' {
@@ -244,7 +251,16 @@ func changeConfig(method, path string, input []byte, ifMatchHeader string, force
 
 	// load this new config; if it fails, we need to revert to
 	// our old representation of caddy's actual config
-	err = unsyncedDecodeAndRun(newCfg, true)
+	candidateCfg, decodeErr := decodeConfig(newCfg)
+	activeCfg := ActiveContext().cfg
+	if configApplyPolicyEnabled(activeCfg) ||
+		(decodeErr == nil && configApplyPolicyEnabled(candidateCfg)) {
+		err = applyConfigTransaction(newCfg, candidateCfg, decodeErr, previousCfgJSON, true)
+	} else if decodeErr != nil {
+		err = decodeErr
+	} else {
+		err = unsyncedRunConfig(newCfg, candidateCfg, true)
+	}
 	if err != nil {
 		if len(rawCfgJSON) > 0 {
 			// restore old config state to keep it consistent
@@ -326,37 +342,14 @@ func indexConfigObjects(ptr any, configPath string, index map[string]string) err
 	return nil
 }
 
-// unsyncedDecodeAndRun removes any meta fields (like @id tags)
-// from cfgJSON, decodes the result into a *Config, and runs
-// it as the new config, replacing any other current config.
-// It does NOT update the raw config state, as this is a
-// lower-level function; most callers will want to use Load
-// instead. A write lock on rawCfgMu is required! If
-// allowPersist is false, it will not be persisted to disk,
-// even if it is configured to.
-func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
-	// remove any @id fields from the JSON, which would cause
-	// loading to break since the field wouldn't be recognized
-	strippedCfgJSON := RemoveMetaFields(cfgJSON)
-
-	var newCfg *Config
-	err := StrictUnmarshalJSON(strippedCfgJSON, &newCfg)
-	if err != nil {
+// unsyncedRunConfig runs an already-decoded config as the new config,
+// replacing any other current config. It does NOT update the raw config
+// state, as this is a lower-level function; most callers will want to use
+// Load instead. A write lock on rawCfgMu is required! If allowPersist is
+// false, it will not be persisted to disk, even if it is configured to.
+func unsyncedRunConfig(cfgJSON []byte, newCfg *Config, allowPersist bool) error {
+	if err := validateConfigLoadPolicy(newCfg, allowPersist); err != nil {
 		return err
-	}
-
-	// prevent recursive config loads; that is a user error, and
-	// although frequent config loads should be safe, we cannot
-	// guarantee that in the presence of third party plugins, nor
-	// do we want this error to go unnoticed (we assume it was a
-	// pulled config if we're not allowed to persist it)
-	if !allowPersist &&
-		newCfg != nil &&
-		newCfg.Admin != nil &&
-		newCfg.Admin.Config != nil &&
-		newCfg.Admin.Config.LoadRaw != nil &&
-		newCfg.Admin.Config.LoadDelay <= 0 {
-		return fmt.Errorf("recursive config loading detected: pulled configs cannot pull other configs without positive load_delay")
 	}
 
 	// run the new config and start all its apps
@@ -374,32 +367,67 @@ func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
 	// Stop, Cleanup each old app
 	unsyncedStop(oldCtx)
 
-	// autosave a non-nil config, if not disabled
-	if allowPersist &&
-		newCfg != nil &&
-		(newCfg.Admin == nil ||
-			newCfg.Admin.Config == nil ||
-			newCfg.Admin.Config.Persist == nil ||
-			*newCfg.Admin.Config.Persist) {
-		dir := filepath.Dir(ConfigAutosavePath)
-		err := os.MkdirAll(dir, 0o700)
-		if err != nil {
-			Log().Error("unable to create folder for config autosave",
-				zap.String("dir", dir),
-				zap.Error(err))
-		} else {
-			err := os.WriteFile(ConfigAutosavePath, cfgJSON, 0o600)
-			if err == nil {
-				Log().Info("autosaved config (load with --resume flag)", zap.String("file", ConfigAutosavePath))
-			} else {
-				Log().Error("unable to autosave config",
-					zap.String("file", ConfigAutosavePath),
-					zap.Error(err))
-			}
-		}
-	}
+	autosaveConfig(cfgJSON, newCfg, allowPersist)
 
 	return nil
+}
+
+func decodeConfig(cfgJSON []byte) (*Config, error) {
+	// remove any @id fields from the JSON, which would cause
+	// loading to break since the field wouldn't be recognized
+	strippedCfgJSON := RemoveMetaFields(cfgJSON)
+
+	var cfg *Config
+	if err := StrictUnmarshalJSON(strippedCfgJSON, &cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func validateConfigLoadPolicy(newCfg *Config, allowPersist bool) error {
+	// prevent recursive config loads; that is a user error, and
+	// although frequent config loads should be safe, we cannot
+	// guarantee that in the presence of third party plugins, nor
+	// do we want this error to go unnoticed (we assume it was a
+	// pulled config if we're not allowed to persist it)
+	if !allowPersist &&
+		newCfg != nil &&
+		newCfg.Admin != nil &&
+		newCfg.Admin.Config != nil &&
+		newCfg.Admin.Config.LoadRaw != nil &&
+		newCfg.Admin.Config.LoadDelay <= 0 {
+		return fmt.Errorf("recursive config loading detected: pulled configs cannot pull other configs without positive load_delay")
+	}
+	return nil
+}
+
+func autosaveConfig(cfgJSON []byte, newCfg *Config, allowPersist bool) {
+	// autosave a non-nil config, if not disabled
+	if !allowPersist ||
+		newCfg == nil ||
+		(newCfg.Admin != nil &&
+			newCfg.Admin.Config != nil &&
+			newCfg.Admin.Config.Persist != nil &&
+			!*newCfg.Admin.Config.Persist) {
+		return
+	}
+
+	dir := filepath.Dir(ConfigAutosavePath)
+	err := os.MkdirAll(dir, 0o700)
+	if err != nil {
+		Log().Error("unable to create folder for config autosave",
+			zap.String("dir", dir),
+			zap.Error(err))
+		return
+	}
+	err = os.WriteFile(ConfigAutosavePath, cfgJSON, 0o600)
+	if err == nil {
+		Log().Info("autosaved config (load with --resume flag)", zap.String("file", ConfigAutosavePath))
+	} else {
+		Log().Error("unable to autosave config",
+			zap.String("file", ConfigAutosavePath),
+			zap.Error(err))
+	}
 }
 
 // run runs newCfg and starts all its apps if
@@ -441,27 +469,15 @@ func run(newCfg *Config, start bool) (Context, error) {
 	}()
 
 	// Start
-	err = func() error {
-		started := make([]string, 0, len(ctx.cfg.apps))
-		for name, a := range ctx.cfg.apps {
-			err := a.Start()
-			if err != nil {
-				// an app failed to start, so we need to stop
-				// all other apps that were already started
-				for _, otherAppName := range started {
-					err2 := ctx.cfg.apps[otherAppName].Stop()
-					if err2 != nil {
-						err = fmt.Errorf("%v; additionally, aborting app %s: %v",
-							err, otherAppName, err2)
-					}
-				}
-				return fmt.Errorf("%s app module: start: %v", name, err)
-			}
-			started = append(started, name)
-		}
-		return nil
-	}()
+	started, err := startApps(ctx)
 	if err != nil {
+		for _, otherAppName := range started {
+			err2 := ctx.cfg.apps[otherAppName].Stop()
+			if err2 != nil {
+				err = fmt.Errorf("%v; additionally, aborting app %s: %v",
+					err, otherAppName, err2)
+			}
+		}
 		return ctx, err
 	}
 	globalMetrics.configSuccess.Set(1)
@@ -474,6 +490,39 @@ func run(newCfg *Config, start bool) (Context, error) {
 	// such as remote admin endpoint, config loader, etc.
 	err = finishSettingUp(ctx, ctx.cfg)
 	return ctx, err
+}
+
+// startApps starts all apps in the context and returns the names of apps that
+// were started successfully. It stops at the first error; callers are
+// responsible for stopping the returned apps.
+func startApps(ctx Context) ([]string, error) {
+	return startAppsOrdered(ctx, false)
+}
+
+// startAppsOrdered starts all apps, optionally sorting them by name. Sorting
+// gives transactional applies a deterministic start order without changing
+// the traditional config load path.
+func startAppsOrdered(ctx Context, ordered bool) ([]string, error) {
+	if ctx.cfg == nil {
+		return nil, nil
+	}
+
+	appNames := make([]string, 0, len(ctx.cfg.apps))
+	for name := range ctx.cfg.apps {
+		appNames = append(appNames, name)
+	}
+	if ordered {
+		slices.Sort(appNames)
+	}
+
+	started := make([]string, 0, len(appNames))
+	for _, name := range appNames {
+		if err := ctx.cfg.apps[name].Start(); err != nil {
+			return started, fmt.Errorf("%s app module: start: %v", name, err)
+		}
+		started = append(started, name)
+	}
+	return started, nil
 }
 
 // provisionContext creates a new context from the given configuration and provisions

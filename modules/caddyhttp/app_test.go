@@ -37,13 +37,13 @@ func TestStopWaitsForPreviousConfiguration(t *testing.T) {
 			t.Run(fmt.Sprintf("http2=%t/grace=%s", http2, grace), func(t *testing.T) {
 				previous, response, release := appWithPendingResponse(t, http2)
 				previous.GracePeriod = caddy.Duration(grace)
-				if err := previous.stop(false); err != nil {
+				if err := previous.stopContext(context.Background(), false, false); err != nil {
 					t.Fatal(err)
 				}
 
 				current := &App{logger: zap.NewNop()}
 				stopped := make(chan error, 1)
-				go func() { stopped <- current.stop(true) }()
+				go func() { stopped <- current.stopContext(context.Background(), true, true) }()
 				select {
 				case err := <-stopped:
 					t.Fatalf("termination returned while the previous response was active: %v", err)
@@ -73,14 +73,14 @@ func TestStopWaitsForPreviousConfiguration(t *testing.T) {
 
 func TestStopPreviousConfigurationGracePeriod(t *testing.T) {
 	previous, response, release := appWithPendingResponse(t, false)
-	if err := previous.stop(false); err != nil {
+	if err := previous.stopContext(context.Background(), false, false); err != nil {
 		t.Fatal(err)
 	}
 
 	current := &App{GracePeriod: caddy.Duration(50 * time.Millisecond), logger: zap.NewNop()}
 	stopped := make(chan error, 1)
 	start := time.Now()
-	go func() { stopped <- current.stop(true) }()
+	go func() { stopped <- current.stopContext(context.Background(), true, true) }()
 	select {
 	case err := <-stopped:
 		if err != nil {
