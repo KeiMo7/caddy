@@ -371,6 +371,7 @@ func (app *App) Provision(ctx caddy.Context) error {
 			if err != nil {
 				return fmt.Errorf("server %s: setting up route handlers: %v", srvName, err)
 			}
+			_, _ = runRouteAudit(srvName, srv.Routes, srv.RouteAudit, app.logger)
 			primaryRoute = srv.Routes.Compile(emptyHandler)
 		}
 		srv.primaryHandlerChain = srv.wrapPrimaryRoute(primaryRoute)

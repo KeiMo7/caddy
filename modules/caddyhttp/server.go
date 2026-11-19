@@ -274,6 +274,11 @@ type Server struct {
 	// EXPERIMENTAL: Subject to change or removal.
 	NamedRoutes map[string]*Route `json:"named_routes,omitempty"`
 
+	// RouteAudit enables static analysis of route overlaps during
+	// configuration loading. It is disabled by default, never affects
+	// request routing, and reports through a dedicated audit logger.
+	RouteAudit *RouteAudit `json:"route_audit,omitempty"`
+
 	// How to handle TLS connections. At least one policy is
 	// required to enable HTTPS on this server if automatic
 	// HTTPS is disabled or does not apply.
