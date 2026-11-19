@@ -10,9 +10,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1032,5 +1034,567 @@ func TestForwardProxyDialErrorRetried(t *testing.T) {
 				t.Errorf("expected 2 attempts (1 try + 1 retry), got %d", got)
 			}
 		})
+	}
+}
+
+func minimalHandlerWithRetryPolicy(t *testing.T, policy *RetryPolicy, upstreams ...*Upstream) *Handler {
+	t.Helper()
+	h := minimalHandler(0, upstreams...)
+	h.LoadBalancing.RetryPolicy = policy
+	if err := policy.compile(h.LoadBalancing); err != nil {
+		t.Fatalf("compiling retry policy: %v", err)
+	}
+	return h
+}
+
+type sequenceTransport struct {
+	mu    sync.Mutex
+	calls int
+	next  func(call int, req *http.Request) (*http.Response, error)
+}
+
+func (t *sequenceTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.mu.Lock()
+	call := t.calls
+	t.calls++
+	t.mu.Unlock()
+	return t.next(call, req)
+}
+
+func (t *sequenceTransport) Calls() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.calls
+}
+
+func testProxyResponse(req *http.Request, statusCode int, body string) *http.Response {
+	return &http.Response{
+		StatusCode:    statusCode,
+		Status:        fmt.Sprintf("%d %s", statusCode, http.StatusText(statusCode)),
+		Header:        make(http.Header),
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Request:       req,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+	}
+}
+
+func serveProxyRequest(t *testing.T, h *Handler, req *http.Request) (int, string, error) {
+	t.Helper()
+	req = prepareTestRequest(req)
+	rec := httptest.NewRecorder()
+	err := h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error {
+		return nil
+	}))
+	status := rec.Code
+	if err != nil {
+		var handlerErr caddyhttp.HandlerError
+		if errors.As(err, &handlerErr) {
+			status = handlerErr.StatusCode
+		}
+	}
+	return status, rec.Body.String(), err
+}
+
+func TestRetryPolicyResponseStatusCodes(t *testing.T) {
+	badServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("bad"))
+	}))
+	t.Cleanup(badServer.Close)
+
+	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("good"))
+	}))
+	t.Cleanup(goodServer.Close)
+
+	upstreams := []*Upstream{
+		{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+		{Host: new(Host), Dial: badServer.Listener.Addr().String()},
+	}
+
+	for _, tc := range []struct {
+		name             string
+		retryStatusCodes []int
+		neverStatusCodes []int
+		wantStatus       int
+		wantBody         string
+	}{
+		{
+			name:             "configured status retries",
+			retryStatusCodes: []int{http.StatusServiceUnavailable},
+			wantStatus:       http.StatusOK,
+			wantBody:         "good",
+		},
+		{
+			name:             "unlisted status is returned",
+			retryStatusCodes: []int{http.StatusBadGateway},
+			wantStatus:       http.StatusServiceUnavailable,
+			wantBody:         "bad",
+		},
+		{
+			name:             "never retry status wins",
+			retryStatusCodes: []int{http.StatusServiceUnavailable},
+			neverStatusCodes: []int{http.StatusServiceUnavailable},
+			wantStatus:       http.StatusServiceUnavailable,
+			wantBody:         "bad",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := minimalHandlerWithRetryPolicy(t, &RetryPolicy{
+				RetryStatusCodes:      tc.retryStatusCodes,
+				NeverRetryStatusCodes: tc.neverStatusCodes,
+				MaxRetries:            1,
+				TotalBudget:           caddy.Duration(time.Second),
+			}, upstreams...)
+
+			status, body, err := serveProxyRequest(t, h, httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if status != tc.wantStatus || body != tc.wantBody {
+				t.Errorf("response = %d %q, want %d %q", status, body, tc.wantStatus, tc.wantBody)
+			}
+		})
+	}
+}
+
+func TestRetryPolicyMethodIdempotency(t *testing.T) {
+	badServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("bad"))
+	}))
+	t.Cleanup(badServer.Close)
+
+	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("good"))
+	}))
+	t.Cleanup(goodServer.Close)
+
+	upstreams := []*Upstream{
+		{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+		{Host: new(Host), Dial: badServer.Listener.Addr().String()},
+	}
+
+	for _, tc := range []struct {
+		name               string
+		method             string
+		idempotencyKey     string
+		retryNonIdempotent bool
+		wantStatus         int
+		wantBody           string
+	}{
+		{
+			name:       "POST defaults to one attempt",
+			method:     http.MethodPost,
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   "bad",
+		},
+		{
+			name:               "POST without key still does not retry",
+			method:             http.MethodPost,
+			retryNonIdempotent: true,
+			wantStatus:         http.StatusServiceUnavailable,
+			wantBody:           "bad",
+		},
+		{
+			name:               "POST with key may retry",
+			method:             http.MethodPost,
+			idempotencyKey:     "order-42",
+			retryNonIdempotent: true,
+			wantStatus:         http.StatusOK,
+			wantBody:           "good",
+		},
+		{
+			name:       "PUT is idempotent",
+			method:     http.MethodPut,
+			wantStatus: http.StatusOK,
+			wantBody:   "good",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := minimalHandlerWithRetryPolicy(t, &RetryPolicy{
+				RetryStatusCodes:   []int{http.StatusServiceUnavailable},
+				MaxRetries:         1,
+				TotalBudget:        caddy.Duration(time.Second),
+				RetryNonIdempotent: tc.retryNonIdempotent,
+			}, upstreams...)
+
+			req := httptest.NewRequest(tc.method, "http://example.com/", nil)
+			if tc.idempotencyKey != "" {
+				req.Header.Set(defaultIdempotencyKeyHeader, tc.idempotencyKey)
+			}
+			status, body, err := serveProxyRequest(t, h, req)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if status != tc.wantStatus || body != tc.wantBody {
+				t.Errorf("response = %d %q, want %d %q", status, body, tc.wantStatus, tc.wantBody)
+			}
+		})
+	}
+}
+
+func TestRetryPolicyRequestBodyReplay(t *testing.T) {
+	const payload = "order payload"
+
+	for _, tc := range []struct {
+		name        string
+		bufferSize  int64
+		wantStatus  int
+		wantBody    string
+		wantGoodHit int32
+	}{
+		{name: "buffered body is replayed", bufferSize: 1024, wantStatus: http.StatusOK, wantBody: payload, wantGoodHit: 1},
+		{name: "unbuffered consumed body is not replayed", bufferSize: 0, wantStatus: http.StatusServiceUnavailable, wantBody: "bad", wantGoodHit: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var goodHits atomic.Int32
+			badServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// Consume the body before failing; a retry without replay would
+				// send an empty body to the next upstream.
+				_, _ = io.ReadAll(r.Body)
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte("bad"))
+			}))
+			t.Cleanup(badServer.Close)
+			goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				goodHits.Add(1)
+				body, _ := io.ReadAll(r.Body)
+				if string(body) != payload {
+					t.Errorf("good upstream received body %q, want %q", body, payload)
+				}
+				_, _ = w.Write(body)
+			}))
+			t.Cleanup(goodServer.Close)
+
+			h := minimalHandlerWithRetryPolicy(t, &RetryPolicy{
+				RetryStatusCodes: []int{http.StatusServiceUnavailable},
+				MaxRetries:       1,
+				TotalBudget:      caddy.Duration(time.Second),
+			},
+				&Upstream{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+				&Upstream{Host: new(Host), Dial: badServer.Listener.Addr().String()},
+			)
+			h.RequestBuffers = tc.bufferSize
+
+			req := httptest.NewRequest(http.MethodPut, "http://example.com/", strings.NewReader(payload))
+			status, body, err := serveProxyRequest(t, h, req)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if status != tc.wantStatus || body != tc.wantBody {
+				t.Errorf("response = %d %q, want %d %q", status, body, tc.wantStatus, tc.wantBody)
+			}
+			if got := goodHits.Load(); got != tc.wantGoodHit {
+				t.Errorf("good upstream hits = %d, want %d", got, tc.wantGoodHit)
+			}
+		})
+	}
+}
+
+func TestRetryPolicyExhaustionPreservesLastResponse(t *testing.T) {
+	firstServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("first"))
+	}))
+	t.Cleanup(firstServer.Close)
+	lastServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Last-Upstream", "true")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("last"))
+	}))
+	t.Cleanup(lastServer.Close)
+
+	h := minimalHandlerWithRetryPolicy(t, &RetryPolicy{
+		RetryStatusCodes: []int{http.StatusServiceUnavailable},
+		MaxRetries:       1,
+		TotalBudget:      caddy.Duration(time.Second),
+	},
+		&Upstream{Host: new(Host), Dial: lastServer.Listener.Addr().String()},
+		&Upstream{Host: new(Host), Dial: firstServer.Listener.Addr().String()},
+	)
+
+	status, body, err := serveProxyRequest(t, h, httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if status != http.StatusServiceUnavailable || body != "last" {
+		t.Errorf("response = %d %q, want 503 %q", status, body, "last")
+	}
+}
+
+func TestRetryPolicyConnectionFailureClasses(t *testing.T) {
+	refused := DialError{&net.OpError{
+		Op:  "dial",
+		Net: "tcp",
+		Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED},
+	}}
+	timeout := DialError{&net.OpError{Op: "dial", Net: "tcp", Err: timeoutError{}}}
+
+	for _, tc := range []struct {
+		name      string
+		failure   error
+		retryOn   []string
+		wantCalls int
+		wantCode  int
+	}{
+		{
+			name:      "connection refused retries",
+			failure:   refused,
+			retryOn:   []string{"connection_refused"},
+			wantCalls: 2,
+			wantCode:  http.StatusOK,
+		},
+		{
+			name:      "connection timeout disabled does not retry",
+			failure:   timeout,
+			retryOn:   []string{"connection_refused"},
+			wantCalls: 1,
+			wantCode:  http.StatusGatewayTimeout,
+		},
+		{
+			name:      "tls handshake retries when enabled",
+			failure:   tlsHandshakeError{errors.New("tls: handshake failure")},
+			retryOn:   []string{"tls_handshake"},
+			wantCalls: 2,
+			wantCode:  http.StatusOK,
+		},
+		{
+			name:      "tls handshake disabled does not retry",
+			failure:   tlsHandshakeError{errors.New("tls: handshake failure")},
+			retryOn:   []string{"connection_refused"},
+			wantCalls: 1,
+			wantCode:  http.StatusBadGateway,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			transport := &sequenceTransport{next: func(call int, req *http.Request) (*http.Response, error) {
+				if call == 0 {
+					return nil, tc.failure
+				}
+				return testProxyResponse(req, http.StatusOK, "ok"), nil
+			}}
+			h := minimalHandlerWithRetryPolicy(t, &RetryPolicy{
+				RetryOn:     tc.retryOn,
+				MaxRetries:  1,
+				TotalBudget: caddy.Duration(time.Second),
+			},
+				&Upstream{Host: new(Host), Dial: "upstream-a.example.com:80"},
+				&Upstream{Host: new(Host), Dial: "upstream-b.example.com:80"},
+			)
+			h.Transport = transport
+
+			status, _, _ := serveProxyRequest(t, h, httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
+			if status != tc.wantCode {
+				t.Errorf("status = %d, want %d", status, tc.wantCode)
+			}
+			if got := transport.Calls(); got != tc.wantCalls {
+				t.Errorf("attempts = %d, want %d", got, tc.wantCalls)
+			}
+		})
+	}
+}
+
+func TestRetryPolicyStopsWhenClientDisconnects(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	transport := &sequenceTransport{next: func(call int, req *http.Request) (*http.Response, error) {
+		cancel()
+		return testProxyResponse(req, http.StatusServiceUnavailable, "disconnected"), nil
+	}}
+	h := minimalHandlerWithRetryPolicy(t, &RetryPolicy{
+		RetryStatusCodes: []int{http.StatusServiceUnavailable},
+		MaxRetries:       5,
+		TotalBudget:      caddy.Duration(time.Second),
+	}, &Upstream{Host: new(Host), Dial: "upstream.example.com:80"})
+	h.Transport = transport
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil).WithContext(ctx)
+	start := time.Now()
+	status, _, _ := serveProxyRequest(t, h, req)
+	if status != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", status, http.StatusServiceUnavailable)
+	}
+	if got := transport.Calls(); got != 1 {
+		t.Errorf("attempts = %d, want 1 after client cancellation", got)
+	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Errorf("retry loop took %s after client cancellation", elapsed)
+	}
+}
+
+func TestRetryPolicyTotalBudget(t *testing.T) {
+	transport := &sequenceTransport{next: func(call int, req *http.Request) (*http.Response, error) {
+		return testProxyResponse(req, http.StatusServiceUnavailable, "busy"), nil
+	}}
+	h := minimalHandlerWithRetryPolicy(t, &RetryPolicy{
+		RetryStatusCodes: []int{http.StatusServiceUnavailable},
+		MaxRetries:       10,
+		TotalBudget:      caddy.Duration(70 * time.Millisecond),
+		InitialInterval:  caddy.Duration(10 * time.Millisecond),
+		MaxInterval:      caddy.Duration(20 * time.Millisecond),
+		Jitter:           0.1,
+	}, &Upstream{Host: new(Host), Dial: "upstream.example.com:80"})
+	h.Transport = transport
+
+	start := time.Now()
+	status, body, err := serveProxyRequest(t, h, httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if status != http.StatusServiceUnavailable || body != "busy" {
+		t.Errorf("response = %d %q, want 503 %q", status, body, "busy")
+	}
+	if calls := transport.Calls(); calls < 2 || calls > 7 {
+		t.Errorf("attempts = %d, want between 2 and 7", calls)
+	}
+	if elapsed > 300*time.Millisecond {
+		t.Errorf("elapsed = %s, total budget was 70ms", elapsed)
+	}
+}
+
+type partialErrorBody struct {
+	sent bool
+}
+
+func (b *partialErrorBody) Read(p []byte) (int, error) {
+	if !b.sent {
+		b.sent = true
+		return copy(p, "partial"), nil
+	}
+	return 0, errors.New("upstream body failed")
+}
+
+func (b *partialErrorBody) Close() error { return nil }
+
+func TestRetryPolicyDoesNotRetryAfterPartialResponse(t *testing.T) {
+	transport := &sequenceTransport{next: func(call int, req *http.Request) (*http.Response, error) {
+		res := testProxyResponse(req, http.StatusOK, "")
+		res.Body = &partialErrorBody{}
+		res.ContentLength = -1
+		return res, nil
+	}}
+	h := minimalHandlerWithRetryPolicy(t, &RetryPolicy{
+		RetryStatusCodes: []int{http.StatusServiceUnavailable},
+		MaxRetries:       3,
+		TotalBudget:      caddy.Duration(time.Second),
+	}, &Upstream{Host: new(Host), Dial: "upstream.example.com:80"})
+	h.Transport = transport
+
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil && recovered != http.ErrAbortHandler {
+				panic(recovered)
+			}
+		}()
+		_ = h.ServeHTTP(
+			httptest.NewRecorder(),
+			prepareTestRequest(httptest.NewRequest(http.MethodGet, "http://example.com/", nil)),
+			caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error { return nil }),
+		)
+	}()
+
+	if got := transport.Calls(); got != 1 {
+		t.Errorf("attempts = %d, want 1 after a partial response", got)
+	}
+}
+
+func TestRetryPolicyFaultInjectionComparison(t *testing.T) {
+	type result struct {
+		attempts int
+		success  bool
+		elapsed  time.Duration
+		status   int
+	}
+
+	runPost500 := func(usePolicy bool) result {
+		transport := &sequenceTransport{next: func(call int, req *http.Request) (*http.Response, error) {
+			if call < 2 {
+				return testProxyResponse(req, http.StatusInternalServerError, "failed"), nil
+			}
+			return testProxyResponse(req, http.StatusOK, "created"), nil
+		}}
+		var h *Handler
+		if usePolicy {
+			h = minimalHandlerWithRetryPolicy(t, &RetryPolicy{
+				RetryStatusCodes: []int{http.StatusInternalServerError},
+				MaxRetries:       2,
+				TotalBudget:      caddy.Duration(time.Second),
+			}, &Upstream{Host: new(Host), Dial: "upstream.example.com:80"})
+		} else {
+			h = minimalHandler(2, &Upstream{Host: new(Host), Dial: "upstream.example.com:80"})
+			h.LoadBalancing.RetryMatch = caddyhttp.MatcherSets{
+				caddyhttp.MatcherSet{newExpressionMatcher(t, "{http.reverse_proxy.status_code} == 500")},
+			}
+		}
+		h.Transport = transport
+		start := time.Now()
+		status, _, _ := serveProxyRequest(t, h, httptest.NewRequest(http.MethodPost, "http://example.com/", nil))
+		return result{attempts: transport.Calls(), success: status == http.StatusOK, elapsed: time.Since(start), status: status}
+	}
+
+	runTimeout := func(usePolicy bool) result {
+		transport := &sequenceTransport{next: func(call int, req *http.Request) (*http.Response, error) {
+			select {
+			case <-time.After(30 * time.Millisecond):
+				return nil, DialError{&net.OpError{Op: "dial", Net: "tcp", Err: timeoutError{}}}
+			case <-req.Context().Done():
+				return nil, DialError{req.Context().Err()}
+			}
+		}}
+		var h *Handler
+		if usePolicy {
+			h = minimalHandlerWithRetryPolicy(t, &RetryPolicy{
+				RetryOn:     []string{"connection_timeout"},
+				MaxRetries:  10,
+				TotalBudget: caddy.Duration(50 * time.Millisecond),
+			}, &Upstream{Host: new(Host), Dial: "upstream.example.com:80"})
+		} else {
+			h = minimalHandler(2, &Upstream{Host: new(Host), Dial: "upstream.example.com:80"})
+		}
+		h.Transport = transport
+		start := time.Now()
+		status, _, _ := serveProxyRequest(t, h, httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
+		return result{attempts: transport.Calls(), success: status == http.StatusOK, elapsed: time.Since(start), status: status}
+	}
+
+	for _, tc := range []struct {
+		name   string
+		legacy result
+		policy result
+	}{
+		{name: "POST 500 (idempotency guard)", legacy: runPost500(false), policy: runPost500(true)},
+		{name: "GET connection timeout (budget guard)", legacy: runTimeout(false), policy: runTimeout(true)},
+	} {
+		t.Logf("%s: legacy attempts=%d success=%t elapsed=%s status=%d | policy attempts=%d success=%t elapsed=%s status=%d",
+			tc.name,
+			tc.legacy.attempts, tc.legacy.success, tc.legacy.elapsed, tc.legacy.status,
+			tc.policy.attempts, tc.policy.success, tc.policy.elapsed, tc.policy.status,
+		)
+
+		if tc.name == "POST 500 (idempotency guard)" {
+			if tc.legacy.attempts < 2 {
+				t.Errorf("legacy should have retried POST, attempts=%d", tc.legacy.attempts)
+			}
+			if tc.policy.attempts != 1 {
+				t.Errorf("policy must send non-idempotent POST once, attempts=%d", tc.policy.attempts)
+			}
+		}
+		if tc.name == "GET connection timeout (budget guard)" {
+			if tc.policy.attempts >= tc.legacy.attempts {
+				t.Errorf("policy should not multiply connection timeout: legacy=%d policy=%d", tc.legacy.attempts, tc.policy.attempts)
+			}
+			if tc.policy.elapsed > 150*time.Millisecond {
+				t.Errorf("policy exceeded total budget by too much: %s", tc.policy.elapsed)
+			}
+			if tc.policy.status != http.StatusGatewayTimeout {
+				t.Errorf("policy status=%d, want 504", tc.policy.status)
+			}
+		}
 	}
 }

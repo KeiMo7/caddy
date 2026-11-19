@@ -446,6 +446,11 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.LoadBalancing == nil {
 		h.LoadBalancing = new(LoadBalancing)
 	}
+	if h.LoadBalancing.RetryPolicy != nil {
+		if err := h.LoadBalancing.RetryPolicy.compile(h.LoadBalancing); err != nil {
+			return err
+		}
+	}
 	if h.LoadBalancing.SelectionPolicy == nil {
 		h.LoadBalancing.SelectionPolicy = RandomSelection{}
 	}
@@ -504,6 +509,15 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	upstreamHealthyUpdater.init()
 
 	return nil
+}
+
+// Validate ensures the reverse proxy configuration is valid.
+func (h *Handler) Validate() error {
+	if h.LoadBalancing == nil || h.LoadBalancing.RetryPolicy == nil {
+		return nil
+	}
+	policy := *h.LoadBalancing.RetryPolicy
+	return policy.compile(h.LoadBalancing)
 }
 
 func (h Handler) streamLogsSkipHandshake() bool {
@@ -672,6 +686,18 @@ func (b *bodyNopCloserIfNotRead) isEmpty() bool {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	start := time.Now()
+
+	// A retry policy's total budget is a hard upper bound for the entire
+	// proxy operation, not merely a check between retries. Put it on the
+	// request context so an in-flight upstream attempt is canceled too.
+	if h.LoadBalancing != nil && h.LoadBalancing.RetryPolicy != nil {
+		if budget := h.LoadBalancing.RetryPolicy.totalBudget(); budget > 0 {
+			ctx, cancel := context.WithTimeout(r.Context(), budget)
+			defer cancel()
+			r = r.WithContext(ctx)
+		}
+	}
 
 	// prepare the request for proxying; this is needed only once
 	clonedReq, err := h.prepareRequest(r, repl)
@@ -737,7 +763,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 	}
 
-	start := time.Now()
 	defer func() {
 		// total proxying duration, including time spent on LB and retries
 		repl.Set("http.reverse_proxy.duration", time.Since(start))
@@ -765,13 +790,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			clonedReq.Body = attemptBody
 		}
 
+		bodyPresent := clonedReq.Body != nil && clonedReq.Body != http.NoBody
+		bodyReplayable := func() bool {
+			if bufferedReqBody != nil {
+				return true
+			}
+			return attemptBody == nil || !attemptBody.didRead()
+		}
+		attempt := &retryAttempt{
+			retries:        retries,
+			start:          start,
+			bodyPresent:    bodyPresent,
+			bodyReplayable: bodyReplayable,
+		}
+
 		var done bool
-		done, proxyErr = h.proxyLoopIteration(clonedReq, r, w, proxyErr, start, retries, repl, reqHeader, reqHost, requestWasIncremental, next)
+		done, proxyErr = h.proxyLoopIteration(clonedReq, r, w, proxyErr, start, retries, attempt, repl, reqHeader, reqHost, requestWasIncremental, next)
 		if attemptBody != nil {
 			// Retire this attempt before deciding whether to reuse the stream.
 			// RoundTrippers may close or read the body asynchronously.
 			attemptBody.Close()
 			if attemptBody.didRead() {
+				if c := h.logger.Check(zapcore.DebugLevel, "not retrying"); c != nil {
+					c.Write(
+						zap.String("reason", "request body was consumed and cannot be replayed"),
+						zap.Bool("body_present", bodyPresent),
+					)
+				}
 				done = true
 			} else if attemptBody.isEmpty() {
 				// the stream is drained but nothing was lost; replay it as empty
@@ -797,6 +842,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	repl.Set("http.reverse_proxy.retries", retries)
 
 	if proxyErr != nil {
+		var responseErr retryableResponseError
+		if errors.As(proxyErr, &responseErr) && responseErr.finalize != nil {
+			return responseErr.finalize(w)
+		}
 		return statusError(proxyErr)
 	}
 
@@ -807,7 +856,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 // that has to be passed in, we brought this into its own method so that we could run defer more easily.
 // It returns true when the loop is done and should break; false otherwise. The error value returned should
 // be assigned to the proxyErr value for the next iteration of the loop (or the error handled after break).
-func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w http.ResponseWriter, proxyErr error, start time.Time, retries int,
+func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w http.ResponseWriter, proxyErr error, start time.Time, retries int, attempt *retryAttempt,
 	repl *caddy.Replacer, reqHeader http.Header, reqHost string, requestWasIncremental bool, next caddyhttp.Handler,
 ) (bool, error) {
 	// get the updated list of upstreams
@@ -846,7 +895,7 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
 		if proxyErr == nil {
 			proxyErr = caddyhttp.Error(http.StatusServiceUnavailable, errNoUpstream)
 		}
-		if !h.LoadBalancing.tryAgain(h.ctx, start, retries, proxyErr, r, h.logger) {
+		if !h.LoadBalancing.tryAgainWithMeta(h.ctx, start, retries, proxyErr, r, h.logger, attempt) {
 			return true, proxyErr
 		}
 		return false, proxyErr
@@ -910,7 +959,7 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
 	}
 
 	// proxy the request to that upstream
-	proxyErr = h.reverseProxy(w, r, origReq, repl, dialInfo, next)
+	proxyErr = h.reverseProxy(w, r, origReq, repl, dialInfo, next, attempt)
 	if proxyErr == nil {
 		return true, nil
 	}
@@ -940,10 +989,14 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
 	}
 
 	// if we've tried long enough, break
-	if !h.LoadBalancing.tryAgain(h.ctx, start, retries, proxyErr, r, h.logger) {
+	if !h.LoadBalancing.tryAgainWithMeta(h.ctx, start, retries, proxyErr, r, h.logger, attempt) {
 		return true, proxyErr
 	}
 
+	var responseErr retryableResponseError
+	if errors.As(proxyErr, &responseErr) && responseErr.response != nil {
+		_ = responseErr.response.Body.Close()
+	}
 	return false, proxyErr
 }
 
@@ -1239,7 +1292,7 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 // reverseProxy performs a round-trip to the given backend and processes the response with the client.
 // (This method is mostly the beginning of what was borrowed from the net/http/httputil package in the
 // Go standard library which was used as the foundation.)
-func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origReq *http.Request, repl *caddy.Replacer, di DialInfo, next caddyhttp.Handler) error {
+func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origReq *http.Request, repl *caddy.Replacer, di DialInfo, next caddyhttp.Handler, attempt *retryAttempt) error {
 	_ = di.Upstream.Host.countRequest(1)
 
 	// Increment the in-flight request count
@@ -1375,14 +1428,31 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 	repl.Set("http.reverse_proxy.status_code", res.StatusCode)
 	repl.Set("http.reverse_proxy.status_text", res.Status)
 
-	// check if the response matches a retry match entry; if so,
-	// close the body and return a retryable error so the request
-	// is retried with the next upstream. Only evaluate matcher sets
-	// with an expression that references response data ({rp.status_code},
-	// {rp.header.*}). Request-only matchers (method, path, or an
-	// expression without response placeholders) are skipped to avoid
-	// retrying every response that matches a request condition
-	if h.LoadBalancing != nil && len(h.LoadBalancing.RetryMatch) > 0 {
+	// Decide response-based retries before any response bytes are committed.
+	// When a policy is configured it is authoritative; otherwise preserve the
+	// existing retry_match behavior.
+	if h.LoadBalancing != nil && h.LoadBalancing.RetryPolicy != nil {
+		meta := retryRequestMeta(req, attempt.bodyPresent, attempt.bodyIsReplayable())
+		meta = meta.withIdempotencyKey(req, h.LoadBalancing.RetryPolicy.IdempotencyKeyHeader)
+		decision := h.LoadBalancing.RetryPolicy.Decide(
+			RetryFailure{Class: RetryFailureResponseStatus, StatusCode: res.StatusCode},
+			meta,
+			attempt.retries,
+			time.Since(attempt.start),
+		)
+		logRetryDecision(h.logger, decision, attempt.retries, req.Method)
+		if decision.Retry {
+			return retryableResponseError{
+				error:      fmt.Errorf("upstream response matched retry policy (%s)", decision.Policy),
+				statusCode: res.StatusCode,
+				decision:   &decision,
+				response:   res,
+				finalize: func(rw http.ResponseWriter) error {
+					return h.finalizeResponse(rw, req, res, repl, start, logger, di.Upstream.String())
+				},
+			}
+		}
+	} else if h.LoadBalancing != nil && len(h.LoadBalancing.RetryMatch) > 0 {
 		for _, matcherSet := range h.LoadBalancing.RetryMatch {
 			if !matcherSetReferencesResponse(matcherSet) {
 				continue
@@ -1620,6 +1690,46 @@ func isClientCanceledH3(err error) bool {
 // the next retry (i.e. no more sleeping is needed). If false is
 // returned, the handler should stop trying to proxy the request.
 func (lb LoadBalancing) tryAgain(ctx caddy.Context, start time.Time, retries int, proxyErr error, req *http.Request, logger *zap.Logger) bool {
+	return lb.tryAgainWithMeta(ctx, start, retries, proxyErr, req, logger, nil)
+}
+
+func (lb LoadBalancing) tryAgainWithMeta(ctx caddy.Context, start time.Time, retries int, proxyErr error, req *http.Request, logger *zap.Logger, attempt *retryAttempt) bool {
+	if req != nil && req.Context().Err() != nil {
+		if logger != nil {
+			logger.Debug("not retrying", zap.String("reason", "client disconnected"))
+		}
+		return false
+	}
+
+	if lb.RetryPolicy != nil {
+		meta := RetryRequestMeta{
+			Method:         "",
+			BodyReplayable: true,
+		}
+		if req != nil {
+			meta.Method = req.Method
+			meta.BodyPresent = req.Body != nil && req.Body != http.NoBody
+		}
+		if attempt != nil {
+			meta.BodyPresent = attempt.bodyPresent
+			meta.BodyReplayable = attempt.bodyIsReplayable()
+		}
+		meta = meta.withIdempotencyKey(req, lb.RetryPolicy.IdempotencyKeyHeader)
+
+		var decision RetryDecision
+		var responseErr retryableResponseError
+		if errors.As(proxyErr, &responseErr) && responseErr.decision != nil {
+			decision = *responseErr.decision
+		} else {
+			decision = lb.RetryPolicy.Decide(classifyRetryFailure(proxyErr), meta, retries, time.Since(start))
+		}
+		logRetryDecision(logger, decision, retries, meta.Method)
+		if !decision.Retry {
+			return false
+		}
+		return lb.waitForRetry(ctx, req, decision.Delay, logger)
+	}
+
 	// no retries are configured
 	if lb.TryDuration == 0 && lb.Retries == 0 {
 		return false
@@ -1679,20 +1789,77 @@ func (lb LoadBalancing) tryAgain(ctx caddy.Context, start time.Time, retries int
 		}
 	}
 
+	return lb.waitForRetry(ctx, req, time.Duration(lb.TryInterval), logger)
+}
+
+func (lb LoadBalancing) waitForRetry(ctx caddy.Context, req *http.Request, delay time.Duration, logger *zap.Logger) bool {
+	var requestDone <-chan struct{}
+	if req != nil {
+		requestDone = req.Context().Done()
+	}
+	if requestDone != nil {
+		select {
+		case <-requestDone:
+			if logger != nil {
+				logger.Debug("not retrying", zap.String("reason", "client disconnected"))
+			}
+			return false
+		default:
+		}
+	}
+
 	// fast path; if the interval is zero, we don't need to wait
-	if lb.TryInterval == 0 {
+	if delay <= 0 {
+		if requestDone != nil {
+			select {
+			case <-requestDone:
+				if logger != nil {
+					logger.Debug("not retrying", zap.String("reason", "client disconnected"))
+				}
+				return false
+			default:
+			}
+		}
+		if ctx.Context != nil {
+			select {
+			case <-ctx.Done():
+				return false
+			default:
+			}
+		}
 		return true
 	}
 
-	// otherwise, wait and try the next available host
-	timer := time.NewTimer(time.Duration(lb.TryInterval))
+	var appDone <-chan struct{}
+	if ctx.Context != nil {
+		appDone = ctx.Done()
+	}
+
+	timer := time.NewTimer(delay)
 	select {
 	case <-timer.C:
+		if requestDone != nil {
+			select {
+			case <-requestDone:
+				if logger != nil {
+					logger.Debug("not retrying", zap.String("reason", "client disconnected"))
+				}
+				return false
+			default:
+			}
+		}
 		return true
-	case <-ctx.Done():
+	case <-appDone:
 		if !timer.Stop() {
-			// if the timer has been stopped then read from the channel
 			<-timer.C
+		}
+		return false
+	case <-requestDone:
+		if !timer.Stop() {
+			<-timer.C
+		}
+		if logger != nil {
+			logger.Debug("not retrying", zap.String("reason", "client disconnected"))
 		}
 		return false
 	}
@@ -1989,7 +2156,8 @@ func statusError(err error) error {
 	statusCode := http.StatusBadGateway
 
 	// timeout errors have a standard status code (see issue #4823)
-	if err, ok := err.(net.Error); ok && err.Timeout() {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
 		statusCode = http.StatusGatewayTimeout
 	}
 
@@ -2046,6 +2214,12 @@ type LoadBalancing struct {
 	// regardless of this setting. Retries use the next available
 	// upstream per the load balancing policy
 	RetryMatchRaw caddyhttp.RawMatcherSets `json:"retry_match,omitempty" caddy:"namespace=http.matchers"`
+
+	// RetryPolicy controls retries by failure class, response status,
+	// request method, request body replayability, and an explicit total
+	// time budget. When set, it supersedes RetryMatch. When absent, the
+	// existing retry behavior is unchanged.
+	RetryPolicy *RetryPolicy `json:"retry_policy,omitempty"`
 
 	SelectionPolicy Selector              `json:"-"`
 	RetryMatch      caddyhttp.MatcherSets `json:"-"`
@@ -2109,6 +2283,9 @@ var hopHeaders = []string{
 // DialError is an error that specifically occurs
 // in a call to Dial or DialContext.
 type DialError struct{ error }
+
+// Unwrap returns the underlying dial error.
+func (e DialError) Unwrap() error { return e.error }
 
 // NewDialError wraps err as a DialError for transports outside this package.
 func NewDialError(err error) DialError {
@@ -2372,6 +2549,9 @@ func (e terminalError) Unwrap() error { return e.error }
 type retryableResponseError struct {
 	error
 	statusCode int
+	decision   *RetryDecision
+	response   *http.Response
+	finalize   func(http.ResponseWriter) error
 }
 
 // bodyReadCloser is a reader that, upon closing, will return
@@ -2523,6 +2703,7 @@ const (
 // Interface guards
 var (
 	_ caddy.Provisioner           = (*Handler)(nil)
+	_ caddy.Validator             = (*Handler)(nil)
 	_ caddy.CleanerUpper          = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
 )

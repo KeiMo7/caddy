@@ -68,6 +68,20 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //	    lb_try_duration <duration>
 //	    lb_try_interval <interval>
 //	    lb_retry_match <matcher>
+//	    lb_retry_policy {
+//	        retry_on <failure...>
+//	        never_retry_on <failure...>
+//	        retry_status_codes <code...>
+//	        never_retry_status_codes <code...>
+//	        max_retries <n>
+//	        total_budget <duration>
+//	        initial_interval <duration>
+//	        max_interval <duration>
+//	        jitter <fraction>
+//	        idempotent_methods <method...>
+//	        retry_non_idempotent
+//	        idempotency_key_header <name>
+//	    }
 //
 //	    # active health checking
 //	    health_uri          <uri>
@@ -341,6 +355,18 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				h.LoadBalancing = new(LoadBalancing)
 			}
 			h.LoadBalancing.RetryMatchRaw = append(h.LoadBalancing.RetryMatchRaw, matcherSet)
+
+		case "lb_retry_policy", "retry_policy":
+			if h.LoadBalancing == nil {
+				h.LoadBalancing = new(LoadBalancing)
+			}
+			if h.LoadBalancing.RetryPolicy != nil {
+				return d.Err("retry policy already specified")
+			}
+			h.LoadBalancing.RetryPolicy = new(RetryPolicy)
+			if err := h.LoadBalancing.RetryPolicy.UnmarshalCaddyfile(d); err != nil {
+				return d.Errf("failed to parse lb_retry_policy: %v", err)
+			}
 
 		case "health_uri":
 			if !d.NextArg() {
