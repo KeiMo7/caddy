@@ -76,11 +76,35 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //	    health_passes       <num>
 //	    health_fails        <num>
 //	    health_timeout      <duration>
+//	    health_observation  <duration>
+//	    health_ramp         <duration>
+//	    health_ramp_curve   <linear|exponential|step>
+//	    health_flap_window  <duration>
+//	    health_flap_threshold <num>
+//	    health_result_history <num>
+//	    health_transition_history <num>
 //	    health_status       <status>
 //	    health_body         <regexp>
 //	    health_method       <value>
 //	    health_request_body <value>
 //	    health_follow_redirects
+//	    health_flap_detection {
+//	        window <duration>
+//	        threshold <num>
+//	        observation <duration>
+//	        ramp <duration>
+//	        ramp_curve <linear|exponential|step>
+//	        result_history <num>
+//	        transition_history <num>
+//	    }
+//	    health_group <name> [<upstreams...>] {
+//	        to <upstreams...>
+//	        fails <num>
+//	        passes <num>
+//	        observation <duration>
+//	        ramp <duration>
+//	        ramp_curve <linear|exponential|step>
+//	    }
 //	    health_headers {
 //	        <field> [<values...>]
 //	    }
@@ -555,6 +579,165 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Errf("invalid fails count '%s': %v", d.Val(), err)
 			}
 			h.HealthChecks.Active.Fails = fails
+
+		case "health_flap_detection":
+			if h.HealthChecks == nil {
+				h.HealthChecks = new(HealthChecks)
+			}
+			if h.HealthChecks.Active == nil {
+				h.HealthChecks.Active = new(ActiveHealthChecks)
+			}
+			if h.HealthChecks.Active.FlapDetection != nil {
+				return d.Err("health_flap_detection already specified")
+			}
+			if d.NextArg() {
+				return d.ArgErr()
+			}
+			flap, err := parseFlapDetectionBlock(d)
+			if err != nil {
+				return err
+			}
+			h.HealthChecks.Active.FlapDetection = flap
+
+		case "health_group":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			name := d.Val()
+			if name == "" {
+				return d.Err("health group name cannot be empty")
+			}
+			if h.HealthChecks == nil {
+				h.HealthChecks = new(HealthChecks)
+			}
+			if h.HealthChecks.Active == nil {
+				h.HealthChecks.Active = new(ActiveHealthChecks)
+			}
+			if h.HealthChecks.Active.Groups == nil {
+				h.HealthChecks.Active.Groups = make(map[string]*ActiveHealthGroup)
+			}
+			if _, exists := h.HealthChecks.Active.Groups[name]; exists {
+				return d.Errf("health_group %q already specified", name)
+			}
+			group := &ActiveHealthGroup{Upstreams: d.RemainingArgs()}
+			if err := parseActiveHealthGroupBlock(d, group); err != nil {
+				return err
+			}
+			h.HealthChecks.Active.Groups[name] = group
+
+		case "health_observation", "health_recovery_observation":
+			duration, err := parseCaddyfilePositiveDuration(d)
+			if err != nil {
+				return err
+			}
+			if h.HealthChecks == nil {
+				h.HealthChecks = new(HealthChecks)
+			}
+			if h.HealthChecks.Active == nil {
+				h.HealthChecks.Active = new(ActiveHealthChecks)
+			}
+			h.HealthChecks.Active.RecoveryObservation = duration
+			h.HealthChecks.Active.recoveryObservationSet = true
+
+		case "health_ramp", "health_recovery_ramp":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			duration, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("bad ramp duration %s: %v", d.Val(), err)
+			}
+			if duration < 0 {
+				return d.Errf("ramp duration cannot be negative")
+			}
+			if d.NextArg() {
+				return d.ArgErr()
+			}
+			if h.HealthChecks == nil {
+				h.HealthChecks = new(HealthChecks)
+			}
+			if h.HealthChecks.Active == nil {
+				h.HealthChecks.Active = new(ActiveHealthChecks)
+			}
+			h.HealthChecks.Active.RecoveryRamp = caddy.Duration(duration)
+			h.HealthChecks.Active.recoveryRampSet = true
+
+		case "health_ramp_curve":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			curve := strings.ToLower(strings.TrimSpace(d.Val()))
+			switch curve {
+			case "linear", "exponential", "step":
+			default:
+				return d.Errf("health_ramp_curve must be one of linear, exponential, or step")
+			}
+			if d.NextArg() {
+				return d.ArgErr()
+			}
+			if h.HealthChecks == nil {
+				h.HealthChecks = new(HealthChecks)
+			}
+			if h.HealthChecks.Active == nil {
+				h.HealthChecks.Active = new(ActiveHealthChecks)
+			}
+			h.HealthChecks.Active.RampCurve = curve
+
+		case "health_flap_window":
+			duration, err := parseCaddyfilePositiveDuration(d)
+			if err != nil {
+				return err
+			}
+			if h.HealthChecks == nil {
+				h.HealthChecks = new(HealthChecks)
+			}
+			if h.HealthChecks.Active == nil {
+				h.HealthChecks.Active = new(ActiveHealthChecks)
+			}
+			h.HealthChecks.Active.FlapWindow = duration
+			h.HealthChecks.Active.flapWindowSet = true
+
+		case "health_flap_threshold":
+			value, err := parseCaddyfilePositiveInt(d)
+			if err != nil {
+				return err
+			}
+			if h.HealthChecks == nil {
+				h.HealthChecks = new(HealthChecks)
+			}
+			if h.HealthChecks.Active == nil {
+				h.HealthChecks.Active = new(ActiveHealthChecks)
+			}
+			h.HealthChecks.Active.FlapThreshold = value
+			h.HealthChecks.Active.flapThresholdSet = true
+
+		case "health_result_history":
+			value, err := parseCaddyfilePositiveInt(d)
+			if err != nil {
+				return err
+			}
+			if h.HealthChecks == nil {
+				h.HealthChecks = new(HealthChecks)
+			}
+			if h.HealthChecks.Active == nil {
+				h.HealthChecks.Active = new(ActiveHealthChecks)
+			}
+			h.HealthChecks.Active.ResultHistory = value
+			h.HealthChecks.Active.resultHistorySet = true
+
+		case "health_transition_history":
+			value, err := parseCaddyfilePositiveInt(d)
+			if err != nil {
+				return err
+			}
+			if h.HealthChecks == nil {
+				h.HealthChecks = new(HealthChecks)
+			}
+			if h.HealthChecks.Active == nil {
+				h.HealthChecks.Active = new(ActiveHealthChecks)
+			}
+			h.HealthChecks.Active.TransitionHistory = value
+			h.HealthChecks.Active.transitionHistorySet = true
 
 		case "max_fails":
 			if !d.NextArg() {

@@ -579,6 +579,8 @@ func unregisterDetachedTunnelTrackers(ts *tunnelTracker) {
 
 // Cleanup cleans up the resources made by h.
 func (h *Handler) Cleanup() error {
+	unregisterHealthStates(h)
+
 	// even if StreamDetached is true, extended connect websockets may still be running
 	err := h.tunnelTracker.cleanupAttachedConnections()
 	for _, upstream := range h.Upstreams {
@@ -842,6 +844,9 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
 
 	// choose an available upstream
 	upstream := h.LoadBalancing.SelectionPolicy.Select(upstreams, r, w)
+	if upstream == nil {
+		upstream = h.selectAllUnhealthyFallback(upstreams)
+	}
 	if upstream == nil {
 		if proxyErr == nil {
 			proxyErr = caddyhttp.Error(http.StatusServiceUnavailable, errNoUpstream)

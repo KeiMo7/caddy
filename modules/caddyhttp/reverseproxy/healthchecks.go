@@ -16,6 +16,8 @@ package reverseproxy
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -116,6 +118,26 @@ type ActiveHealthChecks struct {
 	// a previously healthy backend as unhealthy (default 1).
 	Fails int `json:"fails,omitempty"`
 
+	// FlapDetection optionally enables state transition history, recovery
+	// observation, and gradual traffic ramping. When omitted, active health
+	// checks keep their historical binary pass/fail behavior.
+	FlapDetection *FlapDetection `json:"flap_detection,omitempty"`
+
+	// Convenience equivalents of the corresponding FlapDetection fields.
+	// Setting any of these enables flap detection with defaults for the
+	// remaining fields.
+	RecoveryObservation caddy.Duration `json:"recovery_observation,omitempty"`
+	RecoveryRamp        caddy.Duration `json:"recovery_ramp,omitempty"`
+	RampCurve           string         `json:"ramp_curve,omitempty"`
+	FlapWindow          caddy.Duration `json:"flap_window,omitempty"`
+	FlapThreshold       int            `json:"flap_threshold,omitempty"`
+	ResultHistory       int            `json:"result_history,omitempty"`
+	TransitionHistory   int            `json:"transition_history,omitempty"`
+
+	// Groups optionally overrides pass/fail thresholds and flap detection
+	// settings for named groups of upstreams.
+	Groups map[string]*ActiveHealthGroup `json:"groups,omitempty"`
+
 	// The maximum response body to download from the backend
 	// during a health check.
 	MaxSize int64 `json:"max_size,omitempty"`
@@ -131,10 +153,66 @@ type ActiveHealthChecks struct {
 	httpClient *http.Client
 	bodyRegexp *regexp.Regexp
 	logger     *zap.Logger
+	flap       *FlapDetection
+
+	recoveryObservationSet bool
+	recoveryRampSet        bool
+	flapWindowSet          bool
+	flapThresholdSet       bool
+	resultHistorySet       bool
+	transitionHistorySet   bool
+}
+
+// ActiveHealthGroup overrides active health check thresholds and flap
+// suppression settings for a named group of upstreams.
+type ActiveHealthGroup struct {
+	// Upstreams lists the dial addresses in this group. The upstream's
+	// health_group field may also assign it to a group directly.
+	Upstreams []string `json:"upstreams,omitempty"`
+
+	// Fails overrides ActiveHealthChecks.Fails for this group.
+	Fails int `json:"fails,omitempty"`
+
+	// Passes overrides ActiveHealthChecks.Passes for this group.
+	Passes int `json:"passes,omitempty"`
+
+	// FlapDetection overrides the top-level flap settings for this group.
+	FlapDetection *FlapDetection `json:"flap_detection,omitempty"`
+}
+
+// UnmarshalJSON tracks explicitly configured convenience fields so invalid
+// zero values can be rejected during provisioning.
+func (a *ActiveHealthChecks) UnmarshalJSON(data []byte) error {
+	type alias ActiveHealthChecks
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*a = ActiveHealthChecks(decoded)
+	_, a.recoveryObservationSet = raw["recovery_observation"]
+	_, a.recoveryRampSet = raw["recovery_ramp"]
+	_, a.flapWindowSet = raw["flap_window"]
+	_, a.flapThresholdSet = raw["flap_threshold"]
+	_, a.resultHistorySet = raw["result_history"]
+	_, a.transitionHistorySet = raw["transition_history"]
+	return nil
 }
 
 // Provision ensures that a is set up properly before use.
 func (a *ActiveHealthChecks) Provision(ctx caddy.Context, h *Handler) error {
+	if h.logger != nil {
+		a.logger = h.logger.Named("health_checker.active")
+	} else {
+		a.logger = zap.NewNop()
+	}
+	if err := a.provisionGroups(h); err != nil {
+		return err
+	}
+
 	if !a.IsEnabled() {
 		return nil
 	}
@@ -153,8 +231,6 @@ func (a *ActiveHealthChecks) Provision(ctx caddy.Context, h *Handler) error {
 	if a.Method == "" {
 		a.Method = http.MethodGet
 	}
-
-	h.HealthChecks.Active.logger = h.logger.Named("health_checker.active")
 
 	timeout := time.Duration(a.Timeout)
 	if timeout == 0 {
@@ -218,7 +294,219 @@ func (a *ActiveHealthChecks) Provision(ctx caddy.Context, h *Handler) error {
 		a.Fails = 1
 	}
 
+	if a.FlapsEnabled() && time.Duration(a.Timeout) >= time.Duration(a.Interval) {
+		a.logger.Warn("active health check timeout is greater than or equal to its interval; overlapping probes will be skipped",
+			zap.Duration("interval", time.Duration(a.Interval)),
+			zap.Duration("timeout", time.Duration(a.Timeout)),
+		)
+	}
+
+	for _, upstream := range h.Upstreams {
+		stateConfig := a.stateConfigForUpstream(upstream)
+		state := upstream.ensureHealthState(stateConfig)
+		state.SetIdentity(upstream.Dial, upstream.HealthGroup)
+		registerHealthState(h, upstream, state)
+	}
+	if len(h.Upstreams) > 0 {
+		go func() {
+			<-ctx.Done()
+			unregisterHealthStates(h)
+		}()
+	}
+
 	return nil
+}
+
+// FlapsEnabled reports whether flap suppression is configured.
+func (a *ActiveHealthChecks) FlapsEnabled() bool {
+	if a == nil {
+		return false
+	}
+	if a.flap != nil || a.FlapDetection != nil ||
+		a.RecoveryObservation != 0 || a.RecoveryRamp != 0 || a.RampCurve != "" ||
+		a.FlapWindow != 0 || a.FlapThreshold != 0 || a.ResultHistory != 0 || a.TransitionHistory != 0 ||
+		a.recoveryObservationSet || a.recoveryRampSet || a.flapWindowSet ||
+		a.flapThresholdSet || a.resultHistorySet || a.transitionHistorySet {
+		return true
+	}
+	for _, group := range a.Groups {
+		if group != nil && group.FlapDetection != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *ActiveHealthChecks) resolvedFlapDetection() *FlapDetection {
+	if a == nil {
+		return nil
+	}
+	if a.flap != nil {
+		return a.flap
+	}
+	if a.FlapDetection != nil {
+		a.flap = a.FlapDetection
+		return a.flap
+	}
+	if a.RecoveryObservation == 0 && a.RecoveryRamp == 0 && a.RampCurve == "" &&
+		a.FlapWindow == 0 && a.FlapThreshold == 0 && a.ResultHistory == 0 && a.TransitionHistory == 0 &&
+		!a.recoveryObservationSet && !a.recoveryRampSet && !a.flapWindowSet && !a.flapThresholdSet &&
+		!a.resultHistorySet && !a.transitionHistorySet {
+		return nil
+	}
+	a.flap = &FlapDetection{
+		Window:               a.FlapWindow,
+		Threshold:            a.FlapThreshold,
+		Observation:          a.RecoveryObservation,
+		Ramp:                 a.RecoveryRamp,
+		RampCurve:            a.RampCurve,
+		ResultHistory:        a.ResultHistory,
+		TransitionHistory:    a.TransitionHistory,
+		windowSet:            a.flapWindowSet,
+		thresholdSet:         a.flapThresholdSet,
+		observationSet:       a.recoveryObservationSet,
+		rampSet:              a.recoveryRampSet,
+		resultHistorySet:     a.resultHistorySet,
+		transitionHistorySet: a.transitionHistorySet,
+	}
+	return a.flap
+}
+
+func (a *ActiveHealthChecks) provisionGroups(h *Handler) error {
+	flap := a.resolvedFlapDetection()
+	if err := flap.provision(); err != nil {
+		return err
+	}
+	a.flap = flap
+
+	groupByName := make(map[string]*ActiveHealthGroup, len(a.Groups))
+	for name, group := range a.Groups {
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("active health check group name cannot be empty")
+		}
+		if group == nil {
+			group = new(ActiveHealthGroup)
+			a.Groups[name] = group
+		}
+		if group.Fails < 0 {
+			return fmt.Errorf("active health check group %q fails cannot be negative", name)
+		}
+		if group.Passes < 0 {
+			return fmt.Errorf("active health check group %q passes cannot be negative", name)
+		}
+		effectiveFlap := mergeFlapDetection(flap, group.FlapDetection)
+		if err := effectiveFlap.provision(); err != nil {
+			return fmt.Errorf("active health check group %q: %w", name, err)
+		}
+		group.FlapDetection = effectiveFlap
+		groupByName[name] = group
+	}
+
+	for name, group := range a.Groups {
+		for _, addr := range group.Upstreams {
+			var matched bool
+			for _, upstream := range h.Upstreams {
+				if upstream.HealthGroup != "" && upstream.HealthGroup != name {
+					if upstreamDialMatches(addr, upstream.Dial) {
+						return fmt.Errorf("upstream %s is assigned to multiple active health check groups", upstream.Dial)
+					}
+					continue
+				}
+				if upstreamDialMatches(addr, upstream.Dial) {
+					upstream.HealthGroup = name
+					matched = true
+				}
+			}
+			if !matched {
+				a.logger.Warn("active health check group references an unknown upstream",
+					zap.String("group", name),
+					zap.String("upstream", addr),
+				)
+			}
+		}
+	}
+	for _, upstream := range h.Upstreams {
+		if upstream.HealthGroup == "" {
+			continue
+		}
+		if _, ok := groupByName[upstream.HealthGroup]; !ok {
+			return fmt.Errorf("upstream %s references unknown active health check group %q", upstream.Dial, upstream.HealthGroup)
+		}
+	}
+	return nil
+}
+
+func (a *ActiveHealthChecks) stateConfigForUpstream(upstream *Upstream) HealthStateConfig {
+	passes, fails := a.Passes, a.Fails
+	flap := a.flap
+	if group := a.groupForUpstream(upstream); group != nil {
+		if group.Passes > 0 {
+			passes = group.Passes
+		}
+		if group.Fails > 0 {
+			fails = group.Fails
+		}
+		if group.FlapDetection != nil {
+			flap = group.FlapDetection
+		}
+	}
+	return flap.stateConfig(passes, fails)
+}
+
+func (a *ActiveHealthChecks) groupForUpstream(upstream *Upstream) *ActiveHealthGroup {
+	if a == nil || upstream == nil || upstream.HealthGroup == "" {
+		return nil
+	}
+	return a.Groups[upstream.HealthGroup]
+}
+
+func mergeFlapDetection(parent, child *FlapDetection) *FlapDetection {
+	if child == nil {
+		return parent
+	}
+	if parent == nil {
+		return child
+	}
+	merged := *parent
+	if child.windowSet || child.Window != 0 {
+		merged.Window = child.Window
+		merged.windowSet = child.windowSet
+	}
+	if child.thresholdSet || child.Threshold != 0 {
+		merged.Threshold = child.Threshold
+		merged.thresholdSet = child.thresholdSet
+	}
+	if child.observationSet || child.Observation != 0 {
+		merged.Observation = child.Observation
+		merged.observationSet = child.observationSet
+	}
+	if child.rampSet || child.Ramp != 0 {
+		merged.Ramp = child.Ramp
+		merged.rampSet = child.rampSet
+	}
+	if child.RampCurve != "" {
+		merged.RampCurve = child.RampCurve
+	}
+	if child.resultHistorySet || child.ResultHistory != 0 {
+		merged.ResultHistory = child.ResultHistory
+		merged.resultHistorySet = child.resultHistorySet
+	}
+	if child.transitionHistorySet || child.TransitionHistory != 0 {
+		merged.TransitionHistory = child.TransitionHistory
+		merged.transitionHistorySet = child.transitionHistorySet
+	}
+	return &merged
+}
+
+func upstreamDialMatches(configAddr, dial string) bool {
+	if configAddr == dial {
+		return true
+	}
+	parsed, err := parseUpstreamDialAddress(configAddr)
+	if err != nil {
+		return false
+	}
+	return parsed.dialAddr() == dial
 }
 
 // IsEnabled checks if the active health checks have
@@ -389,6 +677,15 @@ func (h *Handler) doActiveHealthCheckForAllHosts() {
 // returned only if the health check fails to occur or if marking
 // the host's health status fails.
 func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, networkAddr string, upstream *Upstream) error {
+	if !upstream.probeInFlight.CompareAndSwap(false, true) {
+		upstream.overlapSkipped.Add(1)
+		return nil
+	}
+	defer upstream.probeInFlight.Store(false)
+
+	probeStarted := time.Now()
+	probeID := upstream.probeSeq.Add(1)
+
 	// create the URL for the request that acts as a health check
 	u := &url.URL{
 		Scheme: "http",
@@ -466,48 +763,80 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, networ
 		}
 	}
 
-	markUnhealthy := func() {
-		// increment failures and then check if it has reached the threshold to mark unhealthy
-		err := upstream.countHealthFail(1)
-		if err != nil {
-			if c := h.HealthChecks.Active.logger.Check(zapcore.ErrorLevel, "could not count active health failure"); c != nil {
-				c.Write(
-					zap.String("host", upstream.Dial),
-					zap.Error(err),
-				)
-			}
+	markResult := func(outcome HealthCheckOutcome, checkErr error) {
+		state := upstream.healthState
+		if state == nil {
+			state = upstream.ensureHealthState(h.HealthChecks.Active.stateConfigForUpstream(upstream))
+		}
+
+		var errorString string
+		if checkErr != nil {
+			errorString = checkErr.Error()
+		}
+		result := HealthCheckResult{
+			At:       time.Now(),
+			Outcome:  outcome,
+			Success:  outcome == HealthCheckPass,
+			Duration: time.Since(probeStarted),
+			Error:    errorString,
+			ProbeID:  probeID,
+		}
+
+		if outcome == HealthCheckPass {
+			_ = upstream.countHealthPass(1)
+			upstream.activeFails.Store(0)
+		} else if outcome != HealthCheckInterrupted {
+			_ = upstream.countHealthFail(1)
+			upstream.activePasses.Store(0)
+		}
+
+		transition, changed := state.Observe(result)
+		upstream.applyHealthState()
+		if !changed {
 			return
 		}
-		if upstream.activeHealthFails() >= h.HealthChecks.Active.Fails {
-			// dispatch an event that the host newly became unhealthy
-			if upstream.setHealthy(false) {
-				h.events.Emit(h.ctx, "unhealthy", map[string]any{"host": hostAddr})
-				upstream.resetHealth()
-			}
+		if transition.To == HealthStateUnhealthy || transition.To == HealthStateHealthy {
+			upstream.resetHealth()
+		}
+
+		if transition.To == HealthStateUnhealthy && h.events != nil {
+			h.events.Emit(h.ctx, "unhealthy", map[string]any{"host": hostAddr})
+		}
+		if transition.To == HealthStateHealthy && !upstream.ManualUnhealthy() && h.events != nil {
+			h.events.Emit(h.ctx, "healthy", map[string]any{"host": hostAddr})
+		}
+		if h.events != nil {
+			h.events.Emit(h.ctx, "health_state_change", map[string]any{
+				"host":                  hostAddr,
+				"from":                  transition.From,
+				"to":                    transition.To,
+				"reason":                transition.Reason,
+				"automatic":             transition.Automatic,
+				"failure_kind":          transition.FailureKind,
+				"transitions_in_window": transition.TransitionsInWindow,
+				"flapping":              transition.Flapping,
+				"load_factor":           transition.LoadFactor,
+			})
+		}
+		if c := h.HealthChecks.Active.logger.Check(zapcore.InfoLevel, "active health state changed"); c != nil {
+			c.Write(
+				zap.String("host", hostAddr),
+				zap.String("from", transition.From),
+				zap.String("to", transition.To),
+				zap.String("reason", transition.Reason),
+				zap.Int("transitions_in_window", transition.TransitionsInWindow),
+				zap.Bool("flapping", transition.Flapping),
+				zap.Float64("load_factor", transition.LoadFactor),
+			)
 		}
 	}
 
+	markUnhealthy := func(outcome HealthCheckOutcome, checkErr error) {
+		markResult(outcome, checkErr)
+	}
+
 	markHealthy := func() {
-		// increment passes and then check if it has reached the threshold to be healthy
-		err := upstream.countHealthPass(1)
-		if err != nil {
-			if c := h.HealthChecks.Active.logger.Check(zapcore.ErrorLevel, "could not count active health pass"); c != nil {
-				c.Write(
-					zap.String("host", upstream.Dial),
-					zap.Error(err),
-				)
-			}
-			return
-		}
-		if upstream.activeHealthPasses() >= h.HealthChecks.Active.Passes {
-			if upstream.setHealthy(true) {
-				if c := h.HealthChecks.Active.logger.Check(zapcore.InfoLevel, "host is up"); c != nil {
-					c.Write(zap.String("host", hostAddr))
-				}
-				h.events.Emit(h.ctx, "healthy", map[string]any{"host": hostAddr})
-				upstream.resetHealth()
-			}
-		}
+		markResult(HealthCheckPass, nil)
 	}
 
 	// do the request, being careful to tame the response body
@@ -519,7 +848,7 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, networ
 				zap.Error(err),
 			)
 		}
-		markUnhealthy()
+		markUnhealthy(h.classifyActiveHealthError(err), err)
 		return nil
 	}
 	var body io.Reader = resp.Body
@@ -541,7 +870,7 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, networ
 					zap.String("host", hostAddr),
 				)
 			}
-			markUnhealthy()
+			markUnhealthy(HealthCheckBusinessFailure, fmt.Errorf("unexpected status code %d", resp.StatusCode))
 			return nil
 		}
 	} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -551,7 +880,7 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, networ
 				zap.String("host", hostAddr),
 			)
 		}
-		markUnhealthy()
+		markUnhealthy(HealthCheckBusinessFailure, fmt.Errorf("status code out of tolerances: %d", resp.StatusCode))
 		return nil
 	}
 
@@ -565,7 +894,7 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, networ
 					zap.Error(err),
 				)
 			}
-			markUnhealthy()
+			markUnhealthy(h.classifyActiveHealthError(err), err)
 			return nil
 		}
 		if !h.HealthChecks.Active.bodyRegexp.Match(bodyBytes) {
@@ -574,7 +903,7 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, networ
 					zap.String("host", hostAddr),
 				)
 			}
-			markUnhealthy()
+			markUnhealthy(HealthCheckBusinessFailure, fmt.Errorf("response body failed expectations"))
 			return nil
 		}
 	}
@@ -583,6 +912,20 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, networ
 	markHealthy()
 
 	return nil
+}
+
+func (h *Handler) classifyActiveHealthError(err error) HealthCheckOutcome {
+	if h.ctx.Err() != nil && errors.Is(err, context.Canceled) {
+		return HealthCheckInterrupted
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return HealthCheckTimeout
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return HealthCheckTimeout
+	}
+	return HealthCheckProbeFailure
 }
 
 // countFailure is used with passive health checks. It

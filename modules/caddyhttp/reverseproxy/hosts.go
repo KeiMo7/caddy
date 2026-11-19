@@ -17,6 +17,7 @@ package reverseproxy
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/netip"
 	"strconv"
 	"sync"
@@ -52,6 +53,10 @@ type Upstream struct {
 	// check UnhealthyRequestCount value.
 	MaxRequests int `json:"max_requests,omitempty"`
 
+	// HealthGroup optionally assigns this upstream to a named active
+	// health check group configured in HealthChecks.Active.Groups.
+	HealthGroup string `json:"health_group,omitempty"`
+
 	// TODO: This could be really useful, to bind requests
 	// with certain properties to specific backends
 	// HeaderAffinity string
@@ -71,6 +76,15 @@ type Upstream struct {
 	unhealthy    atomic.Int32
 	activePasses atomic.Int64
 	activeFails  atomic.Int64
+
+	healthStateOnce sync.Once
+	healthState     *HealthStateMachine
+	probeInFlight   atomic.Bool
+	probeSeq        atomic.Uint64
+	overlapSkipped  atomic.Uint64
+	rampAdmissions  atomic.Uint64
+	manualRemoval   atomic.Bool
+	loadFactorBits  atomic.Uint64
 }
 
 // (pointer receiver necessary to avoid a race condition, since
@@ -84,27 +98,135 @@ func (u *Upstream) String() string { return u.Dial }
 // policies, etc. to determine if a backend
 // should be able to be sent a request.
 func (u *Upstream) Available() bool {
-	return u.Healthy() && !u.Full()
+	if u.Full() || u.ManualUnhealthy() || !u.healthPolicyOK() {
+		return false
+	}
+	factor := u.LoadFactor()
+	if factor >= 1 {
+		return u.unhealthy.Load() == 0
+	}
+	if factor <= 0 {
+		return false
+	}
+	const admissions = 1000
+	slot := u.rampAdmissions.Add(1) % admissions
+	return slot < uint64(factor*admissions)
 }
 
 // Healthy returns true if the remote host
 // is currently known to be healthy or "up".
 // It consults the circuit breaker, if any.
 func (u *Upstream) Healthy() bool {
-	healthy := u.healthy()
-	if healthy && u.healthCheckPolicy != nil {
-		healthy = u.Host.Fails() < u.healthCheckPolicy.MaxFails
-	}
-	if healthy && u.cb != nil {
-		healthy = u.cb.OK()
-	}
-	return healthy
+	return !u.ManualUnhealthy() && u.healthy() && u.healthPolicyOK()
 }
 
 // Full returns true if the remote host
 // cannot receive more requests at this time.
 func (u *Upstream) Full() bool {
 	return u.MaxRequests > 0 && u.Host.NumRequests() >= u.MaxRequests
+}
+
+func (u *Upstream) healthPolicyOK() bool {
+	if u.Host != nil && u.healthCheckPolicy != nil && u.Host.Fails() >= u.healthCheckPolicy.MaxFails {
+		return false
+	}
+	return u.cb == nil || u.cb.OK()
+}
+
+// LoadFactor returns the fraction of health-check admission slots currently
+// allowed for this upstream. It is 0 while unavailable, 1 when fully healthy,
+// and between 0 and 1 while a recovery ramp is in progress.
+func (u *Upstream) LoadFactor() float64 {
+	bits := u.loadFactorBits.Load()
+	if bits == 0 {
+		if u.unhealthy.Load() == 0 {
+			return 1
+		}
+		return 0
+	}
+	factor := math.Float64frombits(bits)
+	if factor < 0 {
+		return 0
+	}
+	if factor > 1 {
+		return 1
+	}
+	return factor
+}
+
+// HealthSnapshot returns a read-only snapshot of this upstream's active
+// health state. It never performs a probe or changes recovery timers.
+func (u *Upstream) HealthSnapshot(now time.Time) (HealthStateSnapshot, bool) {
+	if u.healthState == nil {
+		return HealthStateSnapshot{}, false
+	}
+	snapshot := u.healthState.Snapshot(now)
+	snapshot.Address = u.Dial
+	snapshot.Group = u.HealthGroup
+	snapshot.OverlapsSkipped = u.overlapSkipped.Load()
+	return snapshot, true
+}
+
+// ManualUnhealthy reports whether traffic is manually disabled for this
+// upstream. Manual removal always takes precedence over automatic recovery.
+func (u *Upstream) ManualUnhealthy() bool {
+	return u.manualRemoval.Load()
+}
+
+// SetManualUnhealthy manually removes an upstream from service, or clears a
+// previous manual removal. Automatic health checks continue to run while the
+// override is active, but cannot make the upstream available.
+func (u *Upstream) SetManualUnhealthy(removed bool, reason string) bool {
+	u.manualRemoval.Store(removed)
+	if u.healthState != nil {
+		_, _ = u.healthState.SetManualRemoval(removed, reason, time.Now())
+	}
+	if removed {
+		u.unhealthy.Store(1)
+		u.loadFactorBits.Store(math.Float64bits(0))
+		return true
+	}
+	if u.healthState == nil {
+		u.unhealthy.Store(0)
+		u.loadFactorBits.Store(math.Float64bits(1))
+		return true
+	}
+	u.applyHealthState()
+	return true
+}
+
+// SetManuallyUnhealthy is an alias for SetManualUnhealthy.
+func (u *Upstream) SetManuallyUnhealthy(removed bool, reason string) bool {
+	return u.SetManualUnhealthy(removed, reason)
+}
+
+// ensureHealthState initializes the per-upstream state machine once.
+func (u *Upstream) ensureHealthState(cfg HealthStateConfig) *HealthStateMachine {
+	u.healthStateOnce.Do(func() {
+		u.healthState = NewHealthStateMachine(cfg)
+	})
+	return u.healthState
+}
+
+// applyHealthState copies the machine's current load factor into the hot-path
+// atomics used by selection policies.
+func (u *Upstream) applyHealthState() {
+	if u.healthState == nil {
+		return
+	}
+	snapshot := u.healthState.Snapshot(time.Now())
+	if snapshot.ManualRemoval {
+		u.unhealthy.Store(1)
+		u.loadFactorBits.Store(math.Float64bits(0))
+		return
+	}
+	factor := snapshot.LoadFactor
+	u.loadFactorBits.Store(math.Float64bits(factor))
+	if snapshot.AutomaticState == HealthStateHealthy {
+		u.unhealthy.Store(0)
+	} else {
+		u.unhealthy.Store(1)
+	}
 }
 
 // fillDialInfo returns a filled DialInfo for upstream u, using the request
@@ -268,7 +390,15 @@ func (u *Upstream) setHealthy(healthy bool) bool {
 	if healthy {
 		unhealthy, compare = 0, 1
 	}
-	return u.unhealthy.CompareAndSwap(compare, unhealthy)
+	changed := u.unhealthy.CompareAndSwap(compare, unhealthy)
+	if changed {
+		if healthy {
+			u.loadFactorBits.Store(math.Float64bits(1))
+		} else {
+			u.loadFactorBits.Store(math.Float64bits(0))
+		}
+	}
+	return changed
 }
 
 // DialInfo contains information needed to dial a

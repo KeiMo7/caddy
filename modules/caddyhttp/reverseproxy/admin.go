@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -34,9 +35,10 @@ type adminUpstreams struct{}
 
 // upstreamStatus holds the status of a particular upstream
 type upstreamStatus struct {
-	Address     string `json:"address"`
-	NumRequests int    `json:"num_requests"`
-	Fails       int    `json:"fails"`
+	Address     string               `json:"address"`
+	NumRequests int                  `json:"num_requests"`
+	Fails       int                  `json:"fails"`
+	Health      *healthStatusSummary `json:"health,omitempty"`
 }
 
 // CaddyModule returns the Caddy module information.
@@ -53,6 +55,14 @@ func (al adminUpstreams) Routes() []caddy.AdminRoute {
 		{
 			Pattern: "/reverse_proxy/upstreams",
 			Handler: caddy.AdminHandlerFunc(al.handleUpstreams),
+		},
+		{
+			Pattern: "/reverse_proxy/health",
+			Handler: caddy.AdminHandlerFunc(al.handleHealth),
+		},
+		{
+			Pattern: "/reverse_proxy/upstreams/manual",
+			Handler: caddy.AdminHandlerFunc(al.handleManualRemoval),
 		},
 	}
 }
@@ -74,6 +84,8 @@ func (adminUpstreams) handleUpstreams(w http.ResponseWriter, r *http.Request) er
 	// Collect the results to respond with
 	results := []upstreamStatus{}
 	knownHosts := make(map[string]struct{})
+	now := time.Now()
+	healthByAddress := healthStatusSummariesByAddress(now)
 
 	// Iterate over the static upstream pool (needs to be fast)
 	var rangeErr error
@@ -102,6 +114,7 @@ func (adminUpstreams) handleUpstreams(w http.ResponseWriter, r *http.Request) er
 			Address:     address,
 			NumRequests: upstream.NumRequests(),
 			Fails:       upstream.Fails(),
+			Health:      healthByAddress[address],
 		})
 		return true
 	})
@@ -113,6 +126,7 @@ func (adminUpstreams) handleUpstreams(w http.ResponseWriter, r *http.Request) er
 				Address:     address,
 				NumRequests: int(count),
 				Fails:       0,
+				Health:      healthByAddress[address],
 			})
 		}
 	}
@@ -128,6 +142,7 @@ func (adminUpstreams) handleUpstreams(w http.ResponseWriter, r *http.Request) er
 			Address:     address,
 			NumRequests: entry.host.NumRequests(),
 			Fails:       entry.host.Fails(),
+			Health:      healthByAddress[address],
 		})
 	}
 	dynamicHostsMu.RUnlock()
@@ -140,5 +155,71 @@ func (adminUpstreams) handleUpstreams(w http.ResponseWriter, r *http.Request) er
 		}
 	}
 
+	return nil
+}
+
+// handleHealth reports detailed active health state transitions and bounded
+// check result history. It is strictly read-only: it never starts a probe or
+// modifies any state machine timers.
+func (adminUpstreams) handleHealth(w http.ResponseWriter, r *http.Request) error {
+	if r.Method != http.MethodGet {
+		return caddy.APIError{
+			HTTPStatus: http.StatusMethodNotAllowed,
+			Err:        fmt.Errorf("method not allowed"),
+		}
+	}
+
+	snapshots := healthStateSnapshots(time.Now())
+	if snapshots == nil {
+		snapshots = []HealthStateSnapshot{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(snapshots); err != nil {
+		return caddy.APIError{
+			HTTPStatus: http.StatusInternalServerError,
+			Err:        err,
+		}
+	}
+	return nil
+}
+
+type manualRemovalRequest struct {
+	Address string `json:"address"`
+	Removed bool   `json:"removed"`
+	Reason  string `json:"reason,omitempty"`
+}
+
+// handleManualRemoval applies or clears a manual upstream removal override.
+// Automatic health checks keep running, but cannot restore an upstream while
+// a manual removal is active.
+func (adminUpstreams) handleManualRemoval(w http.ResponseWriter, r *http.Request) error {
+	if r.Method != http.MethodPost {
+		return caddy.APIError{
+			HTTPStatus: http.StatusMethodNotAllowed,
+			Err:        fmt.Errorf("method not allowed"),
+		}
+	}
+
+	var request manualRemovalRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		return caddy.APIError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        fmt.Errorf("decoding request: %v", err),
+		}
+	}
+	if request.Address == "" {
+		return caddy.APIError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        fmt.Errorf("address is required"),
+		}
+	}
+
+	if changed := applyManualHealthRemoval(request.Address, request.Removed, request.Reason); changed == 0 {
+		return caddy.APIError{
+			HTTPStatus: http.StatusNotFound,
+			Err:        fmt.Errorf("no active health state for upstream %s", request.Address),
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
 	return nil
 }
