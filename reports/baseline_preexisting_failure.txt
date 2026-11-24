@@ -1,0 +1,8 @@
+--- FAIL: TestServer_ClosedRequestBodyDoesNotDesyncHTTP1 (0.10s)
+    --- FAIL: TestServer_ClosedRequestBodyDoesNotDesyncHTTP1/fixed_length_above_drain_limit (0.04s)
+        server_test.go:1972: second response status = 405, want 204 or a closed connection
+    --- FAIL: TestServer_ClosedRequestBodyDoesNotDesyncHTTP1/chunked_above_drain_limit (0.05s)
+        server_test.go:1972: second response status = 400, want 204 or a closed connection
+FAIL
+FAIL	github.com/caddyserver/caddy/v2/modules/caddyhttp	0.109s
+FAIL

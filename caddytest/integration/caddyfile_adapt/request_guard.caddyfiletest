@@ -1,0 +1,66 @@
+localhost
+
+request_guard {
+	max_body_size 2MB
+	oversized_body allow
+	max_decoded_ratio 50
+	disable_rule xss-tag
+	rule my-rule "secret-[a-z]+" targets=query,body compact
+}
+----------
+{
+	"apps": {
+		"http": {
+			"servers": {
+				"srv0": {
+					"listen": [
+						":443"
+					],
+					"routes": [
+						{
+							"match": [
+								{
+									"host": [
+										"localhost"
+									]
+								}
+							],
+							"handle": [
+								{
+									"handler": "subroute",
+									"routes": [
+										{
+											"handle": [
+												{
+													"disabled_rules": [
+														"xss-tag"
+													],
+													"handler": "request_guard",
+													"max_body_size": 2000000,
+													"max_decoded_ratio": 50,
+													"oversized_body": "allow",
+													"rules": [
+														{
+															"compact": true,
+															"id": "my-rule",
+															"pattern": "secret-[a-z]+",
+															"targets": [
+																"query",
+																"body"
+															]
+														}
+													]
+												}
+											]
+										}
+									]
+								}
+							],
+							"terminal": true
+						}
+					]
+				}
+			}
+		}
+	}
+}

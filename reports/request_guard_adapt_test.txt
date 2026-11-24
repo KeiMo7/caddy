@@ -1,0 +1,1 @@
+ok  	github.com/caddyserver/caddy/v2/caddytest/integration	0.102s

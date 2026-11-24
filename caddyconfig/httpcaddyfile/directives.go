@@ -61,7 +61,8 @@ var defaultDirectiveOrder = []string{
 	"header",
 	"copy_response_headers", // only in reverse_proxy's handle_response
 	"request_body",
-	"timeouts", // wraps the response writer, so keep it close to the real writer, ahead of encode/push/etc.
+	"timeouts",      // wraps the response writer, so keep it close to the real writer, ahead of encode/push/etc.
+	"request_guard", // inspects the request after size limits and read timeouts apply
 
 	"redir",
 

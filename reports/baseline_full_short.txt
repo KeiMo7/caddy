@@ -1,0 +1,79 @@
+ok  	github.com/caddyserver/caddy/v2	0.482s
+ok  	github.com/caddyserver/caddy/v2/caddyconfig	0.063s
+ok  	github.com/caddyserver/caddy/v2/caddyconfig/caddyfile	0.126s
+ok  	github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile	0.256s
+?   	github.com/caddyserver/caddy/v2/caddyconfig/warning	[no test files]
+ok  	github.com/caddyserver/caddy/v2/caddytest	0.024s
+ok  	github.com/caddyserver/caddy/v2/caddytest/integration	2.905s
+ok  	github.com/caddyserver/caddy/v2/cmd	0.115s
+?   	github.com/caddyserver/caddy/v2/cmd/caddy	[no test files]
+ok  	github.com/caddyserver/caddy/v2/internal	0.006s
+ok  	github.com/caddyserver/caddy/v2/internal/filesystems	0.004s
+ok  	github.com/caddyserver/caddy/v2/internal/headercheck	1.628s
+ok  	github.com/caddyserver/caddy/v2/internal/metrics	0.003s
+ok  	github.com/caddyserver/caddy/v2/internal/systemd	0.003s
+?   	github.com/caddyserver/caddy/v2/internal/testmocks	[no test files]
+ok  	github.com/caddyserver/caddy/v2/modules/caddyevents	0.009s
+?   	github.com/caddyserver/caddy/v2/modules/caddyevents/eventsconfig	[no test files]
+?   	github.com/caddyserver/caddy/v2/modules/caddyfs	[no test files]
+2026-11-24T10:19:52.269+0800	ERROR	caddyhttp/celmatcher.go:236	evaluating expression	{"error": "no such overload: caddyMatcherLiteral(bool)"}
+github.com/caddyserver/caddy/v2/modules/caddyhttp.MatchExpression.MatchWithError
+	/home/wll/uid81-base/modules/caddyhttp/celmatcher.go:236
+github.com/caddyserver/caddy/v2/modules/caddyhttp.TestCELMatcherLiteralErrors.func1
+	/home/wll/uid81-base/modules/caddyhttp/celmatcher_literal_test.go:179
+testing.tRunner
+	/home/wll/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.0.linux-amd64/src/testing/testing.go:2036
+2026-11-24T10:19:52.277+0800	ERROR	caddyhttp/celmatcher.go:236	evaluating expression	{"error": "duplicate matcher map key: token"}
+github.com/caddyserver/caddy/v2/modules/caddyhttp.MatchExpression.MatchWithError
+	/home/wll/uid81-base/modules/caddyhttp/celmatcher.go:236
+github.com/caddyserver/caddy/v2/modules/caddyhttp.TestCELMatcherLiteralErrors.func1
+	/home/wll/uid81-base/modules/caddyhttp/celmatcher_literal_test.go:179
+testing.tRunner
+	/home/wll/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.0.linux-amd64/src/testing/testing.go:2036
+2026-11-24T10:19:52.277+0800	ERROR	caddyhttp/celmatcher.go:236	evaluating expression	{"error": "compiling matcher regexp [: error parsing regexp: missing closing ]: `[`"}
+github.com/caddyserver/caddy/v2/modules/caddyhttp.MatchExpression.MatchWithError
+	/home/wll/uid81-base/modules/caddyhttp/celmatcher.go:236
+github.com/caddyserver/caddy/v2/modules/caddyhttp.TestCELMatcherLiteralErrors.func1
+	/home/wll/uid81-base/modules/caddyhttp/celmatcher_literal_test.go:179
+testing.tRunner
+	/home/wll/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.0.linux-amd64/src/testing/testing.go:2036
+--- FAIL: TestServer_ClosedRequestBodyDoesNotDesyncHTTP1 (0.07s)
+    --- FAIL: TestServer_ClosedRequestBodyDoesNotDesyncHTTP1/fixed_length_above_drain_limit (0.02s)
+        server_test.go:1972: second response status = 405, want 204 or a closed connection
+    --- FAIL: TestServer_ClosedRequestBodyDoesNotDesyncHTTP1/chunked_above_drain_limit (0.05s)
+        server_test.go:1972: second response status = 400, want 204 or a closed connection
+FAIL
+FAIL	github.com/caddyserver/caddy/v2/modules/caddyhttp	7.441s
+ok  	github.com/caddyserver/caddy/v2/modules/caddyhttp/caddyauth	2.525s
+ok  	github.com/caddyserver/caddy/v2/modules/caddyhttp/encode	0.466s
+?   	github.com/caddyserver/caddy/v2/modules/caddyhttp/encode/brotli	[no test files]
+?   	github.com/caddyserver/caddy/v2/modules/caddyhttp/encode/gzip	[no test files]
+?   	github.com/caddyserver/caddy/v2/modules/caddyhttp/encode/zstd	[no test files]
+ok  	github.com/caddyserver/caddy/v2/modules/caddyhttp/fileserver	0.156s
+ok  	github.com/caddyserver/caddy/v2/modules/caddyhttp/headers	0.046s
+?   	github.com/caddyserver/caddy/v2/modules/caddyhttp/intercept	[no test files]
+?   	github.com/caddyserver/caddy/v2/modules/caddyhttp/logging	[no test files]
+ok  	github.com/caddyserver/caddy/v2/modules/caddyhttp/map	0.022s
+?   	github.com/caddyserver/caddy/v2/modules/caddyhttp/proxyprotocol	[no test files]
+ok  	github.com/caddyserver/caddy/v2/modules/caddyhttp/push	0.020s
+ok  	github.com/caddyserver/caddy/v2/modules/caddyhttp/requestbody	0.020s
+ok  	github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy	4.710s
+ok  	github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy/fastcgi	2.596s
+?   	github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy/forwardauth	[no test files]
+ok  	github.com/caddyserver/caddy/v2/modules/caddyhttp/rewrite	0.031s
+?   	github.com/caddyserver/caddy/v2/modules/caddyhttp/standard	[no test files]
+ok  	github.com/caddyserver/caddy/v2/modules/caddyhttp/templates	0.054s
+ok  	github.com/caddyserver/caddy/v2/modules/caddyhttp/timeouts	3.388s
+ok  	github.com/caddyserver/caddy/v2/modules/caddyhttp/tracing	0.026s
+ok  	github.com/caddyserver/caddy/v2/modules/caddypki	0.034s
+ok  	github.com/caddyserver/caddy/v2/modules/caddypki/acmeserver	0.023s
+ok  	github.com/caddyserver/caddy/v2/modules/caddytls	2.632s
+?   	github.com/caddyserver/caddy/v2/modules/caddytls/distributedstek	[no test files]
+?   	github.com/caddyserver/caddy/v2/modules/caddytls/standardstek	[no test files]
+?   	github.com/caddyserver/caddy/v2/modules/filestorage	[no test files]
+ok  	github.com/caddyserver/caddy/v2/modules/internal/network	0.030s
+ok  	github.com/caddyserver/caddy/v2/modules/logging	0.093s
+ok  	github.com/caddyserver/caddy/v2/modules/metrics	0.018s
+?   	github.com/caddyserver/caddy/v2/modules/standard	[no test files]
+?   	github.com/caddyserver/caddy/v2/notify	[no test files]
+FAIL

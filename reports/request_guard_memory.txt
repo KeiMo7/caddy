@@ -1,0 +1,2 @@
+    memory_test.go:89: 100 MiB body (no length): body=104857600 bytes heap_delta=2937736 bytes total_alloc_delta=5505264 bytes
+    memory_test.go:117: 100 MiB body (declared): body=104857600 bytes heap_delta=52104 bytes total_alloc_delta=52104 bytes

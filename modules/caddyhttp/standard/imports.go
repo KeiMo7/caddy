@@ -16,6 +16,7 @@ import (
 	_ "github.com/caddyserver/caddy/v2/modules/caddyhttp/proxyprotocol"
 	_ "github.com/caddyserver/caddy/v2/modules/caddyhttp/push"
 	_ "github.com/caddyserver/caddy/v2/modules/caddyhttp/requestbody"
+	_ "github.com/caddyserver/caddy/v2/modules/caddyhttp/requestguard"
 	_ "github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
 	_ "github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy/fastcgi"
 	_ "github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy/forwardauth"

@@ -1,0 +1,142 @@
+=== RUN   TestUnmarshalCaddyfile
+--- PASS: TestUnmarshalCaddyfile (0.00s)
+=== RUN   TestUnmarshalCaddyfileInvalidRule
+--- PASS: TestUnmarshalCaddyfileInvalidRule (0.00s)
+=== RUN   TestDecodeMultipleCodings
+--- PASS: TestDecodeMultipleCodings (0.00s)
+=== RUN   TestLargeBodyMemoryIsBounded
+=== RUN   TestLargeBodyMemoryIsBounded/unknown_length
+    memory_test.go:89: 100 MiB body (no length): body=104857600 bytes heap_delta=2938328 bytes total_alloc_delta=5505264 bytes
+=== RUN   TestLargeBodyMemoryIsBounded/declared_length
+    memory_test.go:117: 100 MiB body (declared): body=104857600 bytes heap_delta=52104 bytes total_alloc_delta=52104 bytes
+--- PASS: TestLargeBodyMemoryIsBounded (0.04s)
+    --- PASS: TestLargeBodyMemoryIsBounded/unknown_length (0.02s)
+    --- PASS: TestLargeBodyMemoryIsBounded/declared_length (0.02s)
+=== RUN   TestLargeBodyAllowedPassesThroughObservably
+--- PASS: TestLargeBodyAllowedPassesThroughObservably (0.00s)
+=== RUN   TestDeclaredOversizedBodyIsNotBuffered
+--- PASS: TestDeclaredOversizedBodyIsNotBuffered (0.00s)
+=== RUN   TestPrefilterNeverMissesMatch
+--- PASS: TestPrefilterNeverMissesMatch (0.03s)
+=== RUN   TestProvisionDefaults
+--- PASS: TestProvisionDefaults (0.00s)
+=== RUN   TestProvisionSharedRegistry
+--- PASS: TestProvisionSharedRegistry (0.00s)
+=== RUN   TestProvisionRejectsBadConfig
+--- PASS: TestProvisionRejectsBadConfig (0.00s)
+=== RUN   TestGuardBlocksAndDoesNotReachUpstream
+=== RUN   TestGuardBlocksAndDoesNotReachUpstream/query_string
+=== RUN   TestGuardBlocksAndDoesNotReachUpstream/path_traversal
+=== RUN   TestGuardBlocksAndDoesNotReachUpstream/header
+=== RUN   TestGuardBlocksAndDoesNotReachUpstream/cookie
+=== RUN   TestGuardBlocksAndDoesNotReachUpstream/urlencoded_form
+=== RUN   TestGuardBlocksAndDoesNotReachUpstream/json_body
+=== RUN   TestGuardBlocksAndDoesNotReachUpstream/double_encoded_in_json
+--- PASS: TestGuardBlocksAndDoesNotReachUpstream (0.00s)
+    --- PASS: TestGuardBlocksAndDoesNotReachUpstream/query_string (0.00s)
+    --- PASS: TestGuardBlocksAndDoesNotReachUpstream/path_traversal (0.00s)
+    --- PASS: TestGuardBlocksAndDoesNotReachUpstream/header (0.00s)
+    --- PASS: TestGuardBlocksAndDoesNotReachUpstream/cookie (0.00s)
+    --- PASS: TestGuardBlocksAndDoesNotReachUpstream/urlencoded_form (0.00s)
+    --- PASS: TestGuardBlocksAndDoesNotReachUpstream/json_body (0.00s)
+    --- PASS: TestGuardBlocksAndDoesNotReachUpstream/double_encoded_in_json (0.00s)
+=== RUN   TestGuardAllowsCleanRequestUnchanged
+--- PASS: TestGuardAllowsCleanRequestUnchanged (0.00s)
+=== RUN   TestGuardReplaysBodyByteForByte
+--- PASS: TestGuardReplaysBodyByteForByte (0.00s)
+=== RUN   TestGuardMultipartNestedPayload
+--- PASS: TestGuardMultipartNestedPayload (0.00s)
+=== RUN   TestGuardLogActionForwards
+--- PASS: TestGuardLogActionForwards (0.00s)
+=== RUN   TestGuardOffActionForwards
+--- PASS: TestGuardOffActionForwards (0.00s)
+=== RUN   TestGuardOversizedReject
+--- PASS: TestGuardOversizedReject (0.00s)
+=== RUN   TestGuardOversizedAllowForwardsWholeBody
+--- PASS: TestGuardOversizedAllowForwardsWholeBody (0.00s)
+=== RUN   TestGuardIncompleteBodyRejected
+--- PASS: TestGuardIncompleteBodyRejected (0.00s)
+=== RUN   TestGuardDecompressionBombRejected
+--- PASS: TestGuardDecompressionBombRejected (0.01s)
+=== RUN   TestGuardCompressedCleanBodyForwardsOriginalBytes
+--- PASS: TestGuardCompressedCleanBodyForwardsOriginalBytes (0.00s)
+=== RUN   TestGuardSkipsUpgrade
+--- PASS: TestGuardSkipsUpgrade (0.00s)
+=== RUN   TestGuardIndependentRequests
+--- PASS: TestGuardIndependentRequests (0.00s)
+=== RUN   TestGuardConcurrencyBudget
+--- PASS: TestGuardConcurrencyBudget (0.00s)
+=== RUN   TestGuardConcurrencyBudgetReject
+--- PASS: TestGuardConcurrencyBudgetReject (0.00s)
+=== RUN   TestGuardConcurrentRequestsAreSafe
+--- PASS: TestGuardConcurrentRequestsAreSafe (0.00s)
+=== RUN   TestGuardBodyExactlyAtBudgetIsInspected
+--- PASS: TestGuardBodyExactlyAtBudgetIsInspected (0.00s)
+=== RUN   TestGuardPreservesTrailers
+--- PASS: TestGuardPreservesTrailers (0.00s)
+=== RUN   TestGuardHeaderCountsUnchangedOnCleanBody
+--- PASS: TestGuardHeaderCountsUnchangedOnCleanBody (0.00s)
+=== RUN   TestGuardDecompressionReasonsAreDistinguishable
+--- PASS: TestGuardDecompressionReasonsAreDistinguishable (0.01s)
+=== RUN   TestGuardEmptyBodyWithEncoding
+--- PASS: TestGuardEmptyBodyWithEncoding (0.00s)
+=== RUN   TestGuardOversizedDoesNotWaitForEOF
+--- PASS: TestGuardOversizedDoesNotWaitForEOF (0.00s)
+=== RUN   TestGuardMalformedFormFallsBackToRawScan
+--- PASS: TestGuardMalformedFormFallsBackToRawScan (0.00s)
+=== RUN   TestNormalizeForms
+--- PASS: TestNormalizeForms (0.00s)
+=== RUN   TestCompileRulesRejectsBadConfig
+--- PASS: TestCompileRulesRejectsBadConfig (0.00s)
+=== RUN   TestDisabledRulesAreRemoved
+--- PASS: TestDisabledRulesAreRemoved (0.00s)
+=== RUN   TestRuleTargets
+--- PASS: TestRuleTargets (0.00s)
+=== RUN   TestSquashCommentBecomesSpace
+--- PASS: TestSquashCommentBecomesSpace (0.00s)
+=== RUN   TestRequestBodySizeLimitStillWins
+--- PASS: TestRequestBodySizeLimitStillWins (0.05s)
+=== RUN   TestRouteWithoutGuardIsUnchanged
+--- PASS: TestRouteWithoutGuardIsUnchanged (0.03s)
+=== RUN   TestChunkedUploadNoContentLengthAcrossGuard
+--- PASS: TestChunkedUploadNoContentLengthAcrossGuard (0.03s)
+=== RUN   TestEndToEndBlockedRequestsNeverReachUpstream
+=== RUN   TestEndToEndBlockedRequestsNeverReachUpstream/query_string_injection
+=== RUN   TestEndToEndBlockedRequestsNeverReachUpstream/double_encoded_query_string
+=== RUN   TestEndToEndBlockedRequestsNeverReachUpstream/header_payload
+=== RUN   TestEndToEndBlockedRequestsNeverReachUpstream/cookie_payload
+=== RUN   TestEndToEndBlockedRequestsNeverReachUpstream/form_body_payload
+=== RUN   TestEndToEndBlockedRequestsNeverReachUpstream/json_nested_payload
+=== RUN   TestEndToEndBlockedRequestsNeverReachUpstream/multipart_payload
+=== RUN   TestEndToEndBlockedRequestsNeverReachUpstream/compressed_body_payload
+--- PASS: TestEndToEndBlockedRequestsNeverReachUpstream (0.03s)
+    --- PASS: TestEndToEndBlockedRequestsNeverReachUpstream/query_string_injection (0.00s)
+    --- PASS: TestEndToEndBlockedRequestsNeverReachUpstream/double_encoded_query_string (0.00s)
+    --- PASS: TestEndToEndBlockedRequestsNeverReachUpstream/header_payload (0.00s)
+    --- PASS: TestEndToEndBlockedRequestsNeverReachUpstream/cookie_payload (0.00s)
+    --- PASS: TestEndToEndBlockedRequestsNeverReachUpstream/form_body_payload (0.00s)
+    --- PASS: TestEndToEndBlockedRequestsNeverReachUpstream/json_nested_payload (0.00s)
+    --- PASS: TestEndToEndBlockedRequestsNeverReachUpstream/multipart_payload (0.00s)
+    --- PASS: TestEndToEndBlockedRequestsNeverReachUpstream/compressed_body_payload (0.00s)
+=== RUN   TestEndToEndCleanRequestsArriveUnchanged
+=== RUN   TestEndToEndCleanRequestsArriveUnchanged/json
+=== RUN   TestEndToEndCleanRequestsArriveUnchanged/form
+=== RUN   TestEndToEndCleanRequestsArriveUnchanged/text_with_binary_bytes
+=== RUN   TestEndToEndCleanRequestsArriveUnchanged/empty
+=== RUN   TestEndToEndCleanRequestsArriveUnchanged/large_clean_json
+--- PASS: TestEndToEndCleanRequestsArriveUnchanged (0.04s)
+    --- PASS: TestEndToEndCleanRequestsArriveUnchanged/json (0.00s)
+    --- PASS: TestEndToEndCleanRequestsArriveUnchanged/form (0.00s)
+    --- PASS: TestEndToEndCleanRequestsArriveUnchanged/text_with_binary_bytes (0.00s)
+    --- PASS: TestEndToEndCleanRequestsArriveUnchanged/empty (0.00s)
+    --- PASS: TestEndToEndCleanRequestsArriveUnchanged/large_clean_json (0.00s)
+=== RUN   TestEndToEndCompressedReplay
+--- PASS: TestEndToEndCompressedReplay (0.03s)
+=== RUN   TestEndToEndChunkedBody
+--- PASS: TestEndToEndChunkedBody (0.03s)
+=== RUN   TestEndToEndBytesDoNotChangeUnderEncoding
+--- PASS: TestEndToEndBytesDoNotChangeUnderEncoding (0.03s)
+=== RUN   TestEndToEndFramingPreserved
+--- PASS: TestEndToEndFramingPreserved (0.03s)
+PASS
+ok  	github.com/caddyserver/caddy/v2/modules/caddyhttp/requestguard	0.421s
